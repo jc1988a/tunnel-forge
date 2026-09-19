@@ -42,7 +42,11 @@ jobs:
 
           dh14 = "0x80, 0x04, 0x00, 0x0e"
           assert s.count(dh14) == 2
-          s = s.replace(dh14, "0x80, 0x04, 0x00, 0x02")
+          s = s.replace(
+              dh14,
+              "0x80, 0x04, 0x00, 0x02"
+          )
+
           ike.write_text(s)
 
           prime_hex = (
@@ -68,66 +72,126 @@ jobs:
 
           for i in range(0, 128, 16):
               chunk = ", ".join(
-                  f"0x{x:02x}" for x in prime[i:i+16]
+                  f"0x{x:02x}" for x in prime[i:i + 16]
               )
+
               if i < 112:
                   chunk += ","
+
               lines.append("    " + chunk)
 
           lines.append("};")
 
           Path(
               "android/app/src/main/cpp/modp2048_data.c"
-          ).write_text("\n".join(lines) + "\n")
+          ).write_text(
+              "\n".join(lines) + "\n"
+          )
 
           print("SPMS DH2 patch applied")
           PY
 
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
-        with:
-          flutter-version: "3.41.2"
-          channel: stable
-          cache: true
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: android/gvisor/go.mod
-          cache: true
-          cache-dependency-path: android/gvisor/go.sum
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c
-
-      - name: Get dependencies
-        run: flutter pub get
-
-      - name: Download Go dependencies
-        working-directory: android/gvisor
-        run: go mod download
-
-      - name: Create local.properties
-        working-directory: android
+      - name: Handle Cisco RESPONDER-LIFETIME
         run: |
-          flutter_root="${FLUTTER_ROOT:-$(dirname "$(dirname "$(command -v flutter)")")}"
-          android_sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          echo "flutter.sdk=${flutter_root}" > local.properties
-          echo "sdk.dir=${android_sdk_root}" >> local.properties
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Build APK
-        run: flutter build apk --debug
+          p = Path("android/app/src/main/cpp/ikev1.c")
+          s = p.read_text()
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v6
-        with:
-          name: tunnel-forge-spms-dh2-eap-mschapv2
-          path: build/app/outputs/flutter-apk/app-debug.apk
-          retention-days: 14
-          if-no-files-found: error
+          marker = '''  ike_log_isakmp_summary("Quick Mode reply (msg2)", in, inlen);
+
+          if (in[18] == IKE_EXCH_INFO && (in[19] & IKE_FLAG_ENC)) {
+          '''
+
+          replacement = '''  int qm_lifetime_status_retries = 0;
+
+          qm_process_reply:
+          ike_log_isakmp_summary("Quick Mode reply (msg2)", in, inlen);
+
+          if (in[18] == IKE_EXCH_INFO && (in[19] & IKE_FLAG_ENC)) {
+            int saw_responder_lifetime = 0;
+            int saw_other_notify = 0;
+          '''
+
+          assert marker in s, "Quick Mode entry marker not found"
+          s = s.replace(
+              marker,
+              replacement,
+              1
+          )
+
+          marker = '''        if (info_np == IKE_PT_NOTIFY && pl >= 12) {
+                    uint16_t ntype = util_read_be16(info_plain + w + 4 + 6);
+                    tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG,
+                                      "Quick Mode: server sent NOTIFY type=%u (0x%04x) - proposal rejected", (unsigned)ntype,
+                                      (unsigned)ntype);
+                  }
+          '''
+
+          replacement = '''        if (info_np == IKE_PT_NOTIFY && pl >= 12) {
+                    uint16_t ntype =
+                        util_read_be16(info_plain + w + 4 + 6);
+
+                    if (ntype == 24576u) {
+                      saw_responder_lifetime = 1;
+
+                      tunnel_engine_log(
+                          ANDROID_LOG_INFO,
+                          LOG_TAG,
+                          "Quick Mode: RESPONDER-LIFETIME received; continuing");
+                    } else {
+                      saw_other_notify = 1;
+
+                      tunnel_engine_log(
+                          ANDROID_LOG_ERROR,
+                          LOG_TAG,
+                          "Quick Mode: server sent NOTIFY type=%u (0x%04x)",
+                          (unsigned)ntype,
+                          (unsigned)ntype);
+                    }
+                  }
+          '''
+
+          assert marker in s, "Notify parser marker not found"
+          s = s.replace(
+              marker,
+              replacement,
+              1
+          )
+
+          marker = '''    tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG,
+                              "Quick Mode: server replied with Informational Exchange (not QM2); ESP proposal likely rejected");
+              goto fail_fd;
+            }
+          '''
+
+          replacement = '''    if (saw_responder_lifetime &&
+                !saw_other_notify &&
+                qm_lifetime_status_retries < 3) {
+
+              qm_lifetime_status_retries++;
+
+              tunnel_engine_log(
+                  ANDROID_LOG_INFO,
+                  LOG_TAG,
+                  "Quick Mode: waiting for QM2 after RESPONDER-LIFETIME (try=%d)",
+                  qm_lifetime_status_retries);
+
+              struct pollfd qmpfd = {
+                  .fd = fd,
+                  .events = POLLIN
+              };
+
+              int qmpr = poll(
+                  &qmpfd,
+                  1,
+                  1500
+              );
+
+              if (qmpr > 0 &&
+                  (qmpfd.revents & POLLIN)) {
+
+                ssize_t qmn = recv(
+                    fd,
+                   
