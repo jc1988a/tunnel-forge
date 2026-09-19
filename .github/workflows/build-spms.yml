@@ -12,13 +12,13 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout PR #11 code
+      - name: Checkout PR 11
         uses: actions/checkout@v6
         with:
           repository: NickSimkin/tunnel-forge
           ref: 263ee47dc59dcdb7245dcd80457159e14b76f237
 
-      - name: Patch IKEv1 for SPMS DH2
+      - name: Patch IKEv1 to DH2
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -40,38 +40,47 @@ jobs:
               1
           )
 
-          old = "0x80, 0x04, 0x00, 0x0e"
-          assert s.count(old) == 2
-          s = s.replace(old, "0x80, 0x04, 0x00, 0x02")
-
+          dh14 = "0x80, 0x04, 0x00, 0x0e"
+          assert s.count(dh14) == 2
+          s = s.replace(dh14, "0x80, 0x04, 0x00, 0x02")
           ike.write_text(s)
 
-          Path("android/app/src/main/cpp/modp2048_data.c").write_text(r'''#include <stdint.h>
+          prime_hex = (
+              "FFFFFFFFFFFFFFFFC90FDAA22168C234"
+              "C4C6628B80DC1CD129024E088A67CC74"
+              "020BBEA63B139B22514A08798E3404DD"
+              "EF9519B3CD3A431B302B0A6DF25F1437"
+              "4FE1356D6D51C245E485B576625E7EC6"
+              "F44C42E9A637ED6B0BFF5CB6F406B7ED"
+              "EE386BFB5A899FA5AE9F24117C4B1FE6"
+              "49286651ECE65381FFFFFFFFFFFFFFFF"
+          )
 
-/* RFC 2409 Oakley Group 2 / MODP1024.
- * Symbol name retained to minimise changes to TunnelForge.
- */
-const uint8_t rfc3526_modp2048_p[128] = {
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xc9,0x0f,0xda,0xa2,0x21,0x68,0xc2,0x34,
-    0xc4,0xc6,0x62,0x8b,0x80,0xdc,0x1c,0xd1,
-    0x29,0x02,0x4e,0x08,0x8a,0x67,0xcc,0x74,
-    0x02,0x0b,0xbe,0xa6,0x3b,0x13,0x9b,0x22,
-    0x51,0x4a,0x08,0x79,0x8e,0x34,0x04,0xdd,
-    0xef,0x95,0x19,0xb3,0xcd,0x3a,0x43,0x1b,
-    0x30,0x2b,0x0a,0x6d,0xf2,0x5f,0x14,0x37,
-    0x4f,0xe1,0x35,0x6d,0x6d,0x51,0xc2,0x45,
-    0xe4,0x85,0xb5,0x76,0x62,0x5e,0x7e,0xc6,
-    0xf4,0x4c,0x42,0xe9,0xa6,0x37,0xed,0x6b,
-    0x0b,0xff,0x5c,0xb6,0xf4,0x06,0xb7,0xed,
-    0xee,0x38,0x6b,0xfb,0x5a,0x89,0x9f,0xa5,
-    0xae,0x9f,0x24,0x11,0x7c,0x4b,0x1f,0xe6,
-    0x49,0x28,0x66,0x51,0xec,0xe6,0x53,0x81,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff
-};
-''')
+          prime = bytes.fromhex(prime_hex)
+          assert len(prime) == 128
 
-          print("SPMS patch: IKEv1 3DES/SHA1/PSK + DH2/MODP1024")
+          lines = [
+              "#include <stdint.h>",
+              "",
+              "/* RFC 2409 Oakley Group 2 / MODP1024 */",
+              "const uint8_t rfc3526_modp2048_p[128] = {",
+          ]
+
+          for i in range(0, 128, 16):
+              chunk = ", ".join(
+                  f"0x{x:02x}" for x in prime[i:i+16]
+              )
+              if i < 112:
+                  chunk += ","
+              lines.append("    " + chunk)
+
+          lines.append("};")
+
+          Path(
+              "android/app/src/main/cpp/modp2048_data.c"
+          ).write_text("\n".join(lines) + "\n")
+
+          print("SPMS DH2 patch applied")
           PY
 
       - name: Set up Java
@@ -97,14 +106,14 @@ const uint8_t rfc3526_modp2048_p[128] = {
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c
 
-      - name: Get Flutter dependencies
+      - name: Get dependencies
         run: flutter pub get
 
       - name: Download Go dependencies
         working-directory: android/gvisor
         run: go mod download
 
-      - name: Create Android local.properties
+      - name: Create local.properties
         working-directory: android
         run: |
           flutter_root="${FLUTTER_ROOT:-$(dirname "$(dirname "$(command -v flutter)")")}"
@@ -112,10 +121,10 @@ const uint8_t rfc3526_modp2048_p[128] = {
           echo "flutter.sdk=${flutter_root}" > local.properties
           echo "sdk.dir=${android_sdk_root}" >> local.properties
 
-      - name: Build debug APK
+      - name: Build APK
         run: flutter build apk --debug
 
-      - name: Upload SPMS DH2 APK
+      - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
           name: tunnel-forge-spms-dh2-eap-mschapv2
