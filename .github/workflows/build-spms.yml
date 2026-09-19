@@ -1,1 +1,81 @@
+name: Build SPMS TunnelForge APK
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout PR #11 code
+        uses: actions/checkout@v6
+        with:
+          repository: NickSimkin/tunnel-forge
+          ref: 263ee47dc59dcdb7245dcd80457159e14b76f237
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          flutter-version: "3.41.2"
+          channel: stable
+          cache: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: android/gvisor/go.mod
+          cache: true
+          cache-dependency-path: android/gvisor/go.sum
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Download Go dependencies
+        working-directory: android/gvisor
+        run: go mod download
+
+      - name: Create Android local.properties
+        working-directory: android
+        run: |
+          flutter_root="${FLUTTER_ROOT:-$(dirname "$(dirname "$(command -v flutter)")")}"
+          android_sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          if [[ -z "${android_sdk_root}" ]]; then
+            echo "Android SDK not found" >&2
+            exit 1
+          fi
+
+          {
+            echo "flutter.sdk=${flutter_root}"
+            echo "sdk.dir=${android_sdk_root}"
+          } > local.properties
+
+      - name: Build debug APK
+        run: flutter build apk --debug
+
+      - name: Verify APK exists
+        run: |
+          ls -lh build/app/outputs/flutter-apk/
+          test -f build/app/outputs/flutter-apk/app-debug.apk
+
+      - name: Upload SPMS APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: tunnel-forge-spms-eap-mschapv2
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 14
+          if-no-files-found: error
