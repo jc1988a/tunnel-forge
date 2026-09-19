@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge PPP Control APK
+name: Build SPMS TunnelForge PPP LCP APK
 
 on:
   workflow_dispatch:
@@ -696,9 +696,7 @@ jobs:
           )
 
           # ----------------------------------------------------------
-          # B4. Replace PPP/L2TP demux by POSITION, not exact block
-          #
-          # This fixes the run #9 failure.
+          # B4. Replace PPP/L2TP demux by position
           # ----------------------------------------------------------
 
           recv_start = s.index(
@@ -848,20 +846,323 @@ jobs:
           PY
 
       # ==============================================================
-      # Sanity checks
+      # PPP LCP compatibility
+      #
+      # SPMS response observed:
+      #
+      #   c0 21 04 01 00 0e
+      #   01 04 05 aa
+      #   02 06 00 00 00 00
+      #
+      # = Configure-Reject:
+      #   option 1 MRU
+      #   option 2 ACCM
+      #
+      # TunnelForge already handled ACCM rejection but not MRU.
+      # ==============================================================
+
+      - name: Patch PPP LCP MRU rejection handling
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/cpp/ppp.c")
+          s = p.read_text()
+
+          # ----------------------------------------------------------
+          # 1. Allow MRU to be omitted from Configure-Request
+          # ----------------------------------------------------------
+
+          old = '''static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t auth, uint16_t mru,
+                                  int include_address_control, int include_accm, int include_auth) {
+          '''
+
+          new = '''static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t auth, uint16_t mru,
+                                  int include_address_control, int include_mru, int include_accm, int include_auth) {
+          '''
+
+          assert s.count(old) == 1, (
+              "lcp_build_cr signature marker mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # 2. Make MRU option conditional
+          # ----------------------------------------------------------
+
+          old = '''  out[o++] = 1;
+            out[o++] = 4;
+            util_write_be16(out + o, mru);
+            o += 2;
+            if (include_accm) {
+          '''
+
+          new = '''  if (include_mru) {
+              out[o++] = 1;
+              out[o++] = 4;
+              util_write_be16(out + o, mru);
+              o += 2;
+            }
+            if (include_accm) {
+          '''
+
+          assert s.count(old) == 1, (
+              "MRU option block marker mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # 3. Extend Configure-Reject parser with MRU
+          # ----------------------------------------------------------
+
+          old = '''static void lcp_apply_conf_reject(const uint8_t *lcp, size_t lcp_len, int *include_accm, int *include_auth,
+                                            int *removed_accm, int *removed_auth) {
+            if (removed_accm != NULL)
+              *removed_accm = 0;
+          '''
+
+          new = '''static void lcp_apply_conf_reject(const uint8_t *lcp, size_t lcp_len, int *include_mru, int *include_accm,
+                                            int *include_auth, int *removed_mru, int *removed_accm, int *removed_auth) {
+            if (removed_mru != NULL)
+              *removed_mru = 0;
+            if (removed_accm != NULL)
+              *removed_accm = 0;
+          '''
+
+          assert s.count(old) == 1, (
+              "Configure-Reject function marker mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # 4. Remove MRU when peer rejects option type 1
+          # ----------------------------------------------------------
+
+          old = '''    if (t == 2u && include_accm != NULL && *include_accm) {
+                *include_accm = 0;
+                if (removed_accm != NULL)
+                  *removed_accm = 1;
+              } else if (t == 3u && include_auth != NULL && *include_auth) {
+          '''
+
+          new = '''    if (t == 1u && include_mru != NULL && *include_mru) {
+                *include_mru = 0;
+                if (removed_mru != NULL)
+                  *removed_mru = 1;
+              } else if (t == 2u && include_accm != NULL && *include_accm) {
+                *include_accm = 0;
+                if (removed_accm != NULL)
+                  *removed_accm = 1;
+              } else if (t == 3u && include_auth != NULL && *include_auth) {
+          '''
+
+          assert s.count(old) == 1, (
+              "Configure-Reject option parser marker mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # 5. Track MRU state during LCP negotiation
+          # ----------------------------------------------------------
+
+          old = '''  int lcp_out_include_ac = 1;
+            int lcp_peer_framing_seen = 0;
+            int lcp_accm_in_cr = 1;
+          '''
+
+          new = '''  int lcp_out_include_ac = 1;
+            int lcp_peer_framing_seen = 0;
+            int lcp_mru_in_cr = 1;
+            int lcp_accm_in_cr = 1;
+          '''
+
+          assert s.count(old) == 1, (
+              "LCP option state marker mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # 6. Update initial lcp_build_cr() call
+          # ----------------------------------------------------------
+
+          old = (
+              "lcp_build_cr("
+              "pkt, sizeof(pkt), id, auth, cr_mru, "
+              "1, lcp_accm_in_cr, lcp_auth_in_cr)"
+          )
+
+          new = (
+              "lcp_build_cr("
+              "pkt, sizeof(pkt), id, auth, cr_mru, "
+              "1, lcp_mru_in_cr, "
+              "lcp_accm_in_cr, lcp_auth_in_cr)"
+          )
+
+          assert s.count(old) == 1, (
+              "Initial lcp_build_cr call mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # 7. Update the remaining 3 lcp_build_cr() calls
+          # ----------------------------------------------------------
+
+          old = (
+              "lcp_build_cr("
+              "pkt, sizeof(pkt), id, auth, cr_mru, "
+              "lcp_out_include_ac, "
+              "lcp_accm_in_cr, lcp_auth_in_cr)"
+          )
+
+          new = (
+              "lcp_build_cr("
+              "pkt, sizeof(pkt), id, auth, cr_mru, "
+              "lcp_out_include_ac, "
+              "lcp_mru_in_cr, "
+              "lcp_accm_in_cr, lcp_auth_in_cr)"
+          )
+
+          assert s.count(old) == 3, (
+              f"Expected 3 remaining lcp_build_cr calls, "
+              f"found {s.count(old)}"
+          )
+
+          s = s.replace(
+              old,
+              new
+          )
+
+          # ----------------------------------------------------------
+          # 8. Pass MRU state through Configure-Reject handler
+          # ----------------------------------------------------------
+
+          old = '''        int removed_accm = 0;
+                  int removed_auth = 0;
+                  lcp_apply_conf_reject(p + 2u, (size_t)lcp_len, &lcp_accm_in_cr, &lcp_auth_in_cr, &removed_accm, &removed_auth);
+                  if (removed_accm || removed_auth) {
+                    tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG,
+                                      "ppp lcp: Configure-Reject removed opts accm=%d auth=%d (next CR accm=%d auth=%d)",
+                                      removed_accm, removed_auth, lcp_accm_in_cr, lcp_auth_in_cr);
+                  }
+          '''
+
+          new = '''        int removed_mru = 0;
+                  int removed_accm = 0;
+                  int removed_auth = 0;
+
+                  lcp_apply_conf_reject(
+                      p + 2u,
+                      (size_t)lcp_len,
+                      &lcp_mru_in_cr,
+                      &lcp_accm_in_cr,
+                      &lcp_auth_in_cr,
+                      &removed_mru,
+                      &removed_accm,
+                      &removed_auth
+                  );
+
+                  if (removed_mru ||
+                      removed_accm ||
+                      removed_auth) {
+
+                    tunnel_engine_log(
+                        ANDROID_LOG_DEBUG,
+                        LOG_TAG,
+                        "ppp lcp: Configure-Reject removed opts mru=%d accm=%d auth=%d (next CR mru=%d accm=%d auth=%d)",
+                        removed_mru,
+                        removed_accm,
+                        removed_auth,
+                        lcp_mru_in_cr,
+                        lcp_accm_in_cr,
+                        lcp_auth_in_cr
+                    );
+                  }
+          '''
+
+          assert s.count(old) == 1, (
+              "Configure-Reject handler call marker mismatch"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          # ----------------------------------------------------------
+          # Final structural checks
+          # ----------------------------------------------------------
+
+          assert (
+              "int include_address_control, int include_mru, "
+              "int include_accm, int include_auth"
+          ) in s
+
+          assert (
+              "t == 1u && include_mru != NULL && *include_mru"
+          ) in s
+
+          assert (
+              "int lcp_mru_in_cr = 1;"
+          ) in s
+
+          assert s.count(
+              "lcp_mru_in_cr, lcp_accm_in_cr, lcp_auth_in_cr"
+          ) == 4
+
+          p.write_text(s)
+
+          print(
+              "SPMS PPP LCP patch applied successfully: "
+              "MRU and ACCM can now be removed after Configure-Reject"
+          )
+          PY
+
+      # ==============================================================
+      # Sanity checks before expensive build
       # ==============================================================
 
       - name: Verify SPMS patches
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "=== DH2 ==="
+          echo "===== DH2 ====="
 
           grep -n \
             "IKE_DH_PUBKEY_BYTES 128" \
             android/app/src/main/cpp/ikev1.c
 
-          echo "=== RESPONDER-LIFETIME ==="
+          echo "===== RESPONDER-LIFETIME ====="
 
           grep -n \
             "preserving original SA" \
@@ -871,19 +1172,19 @@ jobs:
             "original QM2 received" \
             android/app/src/main/cpp/ikev1.c
 
-          echo "=== MODP1024 ==="
+          echo "===== MODP1024 ====="
 
           grep -n \
             "rfc3526_modp2048_p\[128\]" \
             android/app/src/main/cpp/modp2048_data.c
 
-          echo "=== POST ICCN ==="
+          echo "===== POST ICCN ====="
 
           grep -n \
             "preserving first post-ICCN packet" \
             android/app/src/main/cpp/l2tp.c
 
-          echo "=== IKE FILTER ==="
+          echo "===== IKE FILTER ====="
 
           grep -n \
             "IKE packet on UDP/4500 ignored" \
@@ -893,13 +1194,27 @@ jobs:
             "bare IKE packet ignored" \
             android/app/src/main/cpp/ppp.c
 
-          echo "=== L2TP CONTROL DEMUX ==="
+          echo "===== L2TP CONTROL DEMUX ====="
 
           grep -n \
             "processed L2TP control packet" \
             android/app/src/main/cpp/ppp.c
 
-          echo "=== OLD POST-ICCN DRAIN MUST BE GONE ==="
+          echo "===== LCP MRU REJECT ====="
+
+          grep -n \
+            "int lcp_mru_in_cr = 1" \
+            android/app/src/main/cpp/ppp.c
+
+          grep -n \
+            "t == 1u && include_mru" \
+            android/app/src/main/cpp/ppp.c
+
+          grep -n \
+            "Configure-Reject removed opts mru=" \
+            android/app/src/main/cpp/ppp.c
+
+          echo "===== OLD POST-ICCN DRAIN MUST BE GONE ====="
 
           if grep -Fq \
             "(void)recv_plain(esp_fd, esp, NULL, NULL, in, sizeof(in), 1500);" \
@@ -909,7 +1224,7 @@ jobs:
             exit 1
           fi
 
-          echo "All SPMS patches verified"
+          echo "All SPMS patch checks passed"
 
       # ==============================================================
       # Build environment
@@ -968,13 +1283,17 @@ jobs:
 
       - name: Verify APK
         run: |
+          set -euo pipefail
+
           test -f build/app/outputs/flutter-apk/app-debug.apk
-          ls -lh build/app/outputs/flutter-apk/app-debug.apk
+
+          ls -lh \
+            build/app/outputs/flutter-apk/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-preserve-sa-ppp-control-v10
+          name: tunnel-forge-spms-dh2-preserve-sa-ppp-lcp-v11
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
