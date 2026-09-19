@@ -18,6 +18,10 @@ jobs:
           repository: NickSimkin/tunnel-forge
           ref: 263ee47dc59dcdb7245dcd80457159e14b76f237
 
+      # ==============================================================
+      # IKE / IPsec patches for SPMS
+      # ==============================================================
+
       - name: Apply SPMS IKE compatibility patches
         run: |
           python3 - <<'PY'
@@ -26,9 +30,10 @@ jobs:
           p = Path("android/app/src/main/cpp/ikev1.c")
           s = p.read_text()
 
-          # ============================================================
-          # 1. Phase 1: DH14 / MODP2048 -> DH2 / MODP1024
-          # ============================================================
+          # ----------------------------------------------------------
+          # 1. Phase 1:
+          #    DH14 / MODP2048 -> DH2 / MODP1024
+          # ----------------------------------------------------------
 
           old = "#define IKE_DH_PUBKEY_BYTES 256"
           new = "#define IKE_DH_PUBKEY_BYTES 128"
@@ -45,16 +50,21 @@ jobs:
           dh14 = "0x80, 0x04, 0x00, 0x0e"
           dh2 = "0x80, 0x04, 0x00, 0x02"
 
-          assert s.count(dh14) == 2, (
-              f"Expected 2 DH14 attributes, found {s.count(dh14)}"
+          count = s.count(dh14)
+
+          assert count == 2, (
+              f"Expected 2 DH14 attributes, found {count}"
           )
 
           s = s.replace(dh14, dh2)
 
-          # ============================================================
-          # 2. RESPONDER-LIFETIME:
-          #    preserve original Quick Mode SA and wait for QM2
-          # ============================================================
+          # ----------------------------------------------------------
+          # 2. Cisco/SPMS RESPONDER-LIFETIME
+          #
+          # Preserve original Quick Mode SA.
+          # DO NOT retransmit QM1.
+          # Wait for QM2 belonging to original qm_mid.
+          # ----------------------------------------------------------
 
           start_marker = (
               '  ike_log_isakmp_summary('
@@ -66,11 +76,15 @@ jobs:
               'util_read_be32(in + 20) != qm_mid) {'
           )
 
-          assert start_marker in s, "Quick Mode start marker not found"
+          assert start_marker in s, (
+              "Quick Mode start marker not found"
+          )
 
           start = s.index(start_marker)
 
-          assert end_marker in s[start:], "Quick Mode end marker not found"
+          assert end_marker in s[start:], (
+              "Quick Mode end marker not found"
+          )
 
           end = s.index(end_marker, start)
 
@@ -280,10 +294,10 @@ jobs:
               }
 
               /*
-               * UDP/4500:
+               * NAT-T on UDP/4500:
                *
-               * IKE = 00000000 + ISAKMP
-               * ESP = begins directly with SPI
+               * IKE = 00 00 00 00 + ISAKMP
+               * ESP = SPI starts immediately
                */
               if (prefix) {
 
@@ -323,12 +337,20 @@ jobs:
               uint32_t message_id =
                   util_read_be32(in + 20);
 
+              /*
+               * Additional Informational status:
+               * do not replace/restart original SA.
+               */
               if (exchange == IKE_EXCH_INFO &&
                   (flags & IKE_FLAG_ENC)) {
 
                 continue;
               }
 
+              /*
+               * Accept only encrypted Quick Mode reply
+               * belonging to original QM1.
+               */
               if (exchange == IKE_EXCH_QUICK &&
                   (flags & IKE_FLAG_ENC) &&
                   message_id == qm_mid) {
@@ -370,9 +392,9 @@ jobs:
 
           p.write_text(s)
 
-          # ============================================================
+          # ----------------------------------------------------------
           # 3. RFC 2409 Oakley Group 2 / MODP1024 prime
-          # ============================================================
+          # ----------------------------------------------------------
 
           prime_hex = (
               "FFFFFFFFFFFFFFFFC90FDAA22168C234"
@@ -423,14 +445,20 @@ jobs:
           )
           PY
 
+      # ==============================================================
+      # L2TP -> PPP transition patches
+      # ==============================================================
+
       - name: Patch L2TP to PPP transition
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          # ============================================================
-          # 1. Do NOT blindly drain the first post-ICCN packet.
-          # ============================================================
+          # ----------------------------------------------------------
+          # A. l2tp.c
+          #
+          # Do not blindly consume the first post-ICCN packet.
+          # ----------------------------------------------------------
 
           lp = Path(
               "android/app/src/main/cpp/l2tp.c"
@@ -438,47 +466,56 @@ jobs:
 
           ls = lp.read_text()
 
-          old = '''  /* Drain stray post-handshake datagram so data-plane loop does not inherit stale control noise. */
-          (void)recv_plain(esp_fd, esp, NULL, NULL, in, sizeof(in), 1500);
+          drain_comment = (
+              "  /* Drain stray post-handshake datagram "
+              "so data-plane loop does not inherit stale "
+              "control noise. */\n"
+          )
 
-          tunnel_log("l2tp ok remote_tid=%u remote_sid=%u local_tid=%u local_sid=%u", (unsigned)s->tunnel_id,
-          '''
+          if drain_comment in ls:
+              ls = ls.replace(
+                  drain_comment,
+                  "",
+                  1
+              )
 
-          new = '''  /*
+          drain_line = (
+              "  (void)recv_plain("
+              "esp_fd, esp, NULL, NULL, "
+              "in, sizeof(in), 1500);"
+          )
+
+          assert drain_line in ls, (
+              "post-ICCN recv_plain drain line not found"
+          )
+
+          drain_replacement = '''  /*
            * SPMS/Cisco compatibility:
            *
-           * Do not blindly drain the first packet after ICCN.
-           * The peer may send a valid L2TP control message here.
-           *
-           * PPP recv will now demultiplex and ACK L2TP control
-           * packets before accepting PPP data.
+           * Preserve the first post-ICCN datagram.
+           * It can contain an L2TP control message that
+           * must be acknowledged before PPP proceeds.
            */
           tunnel_engine_log(
               ANDROID_LOG_DEBUG,
               LOG_TAG,
               "l2tp: preserving first post-ICCN packet for PPP/control demux"
-          );
-
-          tunnel_log("l2tp ok remote_tid=%u remote_sid=%u local_tid=%u local_sid=%u", (unsigned)s->tunnel_id,
-          '''
-
-          assert old in ls, (
-              "Post-handshake drain marker not found"
-          )
+          );'''
 
           ls = ls.replace(
-              old,
-              new,
+              drain_line,
+              drain_replacement,
               1
           )
 
           lp.write_text(ls)
 
-          # ============================================================
-          # 2. PPP recv:
-          #    - distinguish IKE from ESP on UDP/4500
-          #    - process L2TP control packets instead of dropping them
-          # ============================================================
+          # ----------------------------------------------------------
+          # B. ppp.c
+          #
+          # - distinguish IKE from ESP on UDP/4500
+          # - process L2TP control while PPP negotiates
+          # ----------------------------------------------------------
 
           pp = Path(
               "android/app/src/main/cpp/ppp.c"
@@ -486,9 +523,9 @@ jobs:
 
           s = pp.read_text()
 
-          # ------------------------------------------------------------
-          # Add local IKEv1 datagram detector
-          # ------------------------------------------------------------
+          # ----------------------------------------------------------
+          # B1. Add helper to recognise IKEv1 datagrams
+          # ----------------------------------------------------------
 
           marker = '''static long long ppp_now_ms(void) {
             struct timeval now;
@@ -505,30 +542,45 @@ jobs:
           }
 
           /*
-           * UDP/4500 carries both ESP and IKE when NAT-T is active.
+           * Validate basic IKEv1/ISAKMP framing.
            *
-           * Validate the basic IKEv1 ISAKMP framing before allowing
-           * a datagram into ESP decryption.
+           * UDP/4500 can carry IKE and ESP on the same socket.
+           * IKE packets must never be passed to ESP decryption.
            */
           static int ppp_isakmp_datagram_like(
               const uint8_t *p,
               size_t len) {
 
-            if (p == NULL || len < 28u) {
+            if (p == NULL ||
+                len < 28u) {
+
               return 0;
             }
 
+            /*
+             * ISAKMP Version:
+             * IKEv1 = 0x10
+             */
             if (p[17] != 0x10u) {
               return 0;
             }
 
             uint32_t isakmp_len =
-                util_read_be32(p + 24);
+                util_read_be32(
+                    p + 24
+                );
 
-            return (
-                isakmp_len >= 28u &&
-                isakmp_len == (uint32_t)len
-            );
+            if (isakmp_len < 28u) {
+              return 0;
+            }
+
+            if (isakmp_len !=
+                (uint32_t)len) {
+
+              return 0;
+            }
+
+            return 1;
           }
 
           '''
@@ -543,9 +595,9 @@ jobs:
               1
           )
 
-          # ------------------------------------------------------------
-          # recv_ppp needs peer endpoint so control packets can be ACKed
-          # ------------------------------------------------------------
+          # ----------------------------------------------------------
+          # B2. recv_ppp needs peer endpoint to ACK control packets
+          # ----------------------------------------------------------
 
           old = '''static int recv_ppp(int esp_fd, esp_keys_t *esp, l2tp_session_t *l2tp, uint8_t *out, size_t cap, int ms) {
           '''
@@ -571,16 +623,16 @@ jobs:
               1
           )
 
-          # ------------------------------------------------------------
-          # Filter NAT-T keepalive + IKE before ESP decrypt
-          # ------------------------------------------------------------
+          # ----------------------------------------------------------
+          # B3. Filter NAT-T keepalive / IKE BEFORE ESP decrypt
+          # ----------------------------------------------------------
 
           marker = '''    uint8_t plain[4096];
               size_t plen = sizeof(plain);
           '''
 
           replacement = '''    /*
-               * NAT-T keepalive: one byte 0xff.
+               * NAT-T keepalive.
                */
               if (esp->udp_encap &&
                   n == 1 &&
@@ -600,10 +652,11 @@ jobs:
                *
                * 00 00 00 00 + IKE
                *
-               * Do not pass this packet to ESP decrypt.
+               * Strip/check only for classification.
+               * Do not feed the packet to ESP decrypt.
                */
               if (esp->udp_encap &&
-                  n >= 4 &&
+                  n >= 32 &&
                   util_read_be32(raw) == 0u &&
                   ppp_isakmp_datagram_like(
                       raw + 4,
@@ -619,7 +672,15 @@ jobs:
               }
 
               /*
-               * Defensive handling for bare ISAKMP packets.
+               * Some receive paths can expose ISAKMP without
+               * the four-byte non-ESP marker.
+               *
+               * The old log:
+               *
+               *   esp decrypt spi mismatch got=377120e8
+               *
+               * matched the IKE initiator cookie rather than
+               * a genuine inbound ESP SPI.
                */
               if (esp->udp_encap &&
                   ppp_isakmp_datagram_like(
@@ -649,9 +710,9 @@ jobs:
               1
           )
 
-          # ------------------------------------------------------------
-          # Process L2TP control T=1 during PPP negotiation
-          # ------------------------------------------------------------
+          # ----------------------------------------------------------
+          # B4. Demux L2TP control packets during PPP negotiation
+          # ----------------------------------------------------------
 
           marker = '''    if (plen < 6u) {
               tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG, "ppp recv short decap plen=%zu", plen);
@@ -661,6 +722,7 @@ jobs:
           '''
 
           replacement = '''    if (plen < 2u) {
+
               tunnel_engine_log(
                   ANDROID_LOG_WARN,
                   LOG_TAG,
@@ -671,18 +733,23 @@ jobs:
               continue;
             }
 
+            uint16_t l2tp_flags =
+                util_read_be16(
+                    plain
+                );
+
             /*
              * RFC 2661:
-             * bit T = 1 means L2TP CONTROL, not PPP data.
              *
-             * During the L2TP -> PPP transition Cisco/SPMS may still
-             * send control traffic. Process and ACK it instead of
-             * throwing it away as "not-ppp-data".
+             * T=1 -> L2TP CONTROL packet
+             * T=0 -> L2TP DATA / PPP
+             *
+             * The peer may still send control messages immediately
+             * after ICCN. They must be dispatched/ACKed instead of
+             * being discarded as "not-ppp-data".
              */
-            uint16_t l2tp_flags =
-                util_read_be16(plain);
-
-            if ((l2tp_flags & 0x8000u) != 0u) {
+            if ((l2tp_flags &
+                 0x8000u) != 0u) {
 
               int control_rc =
                   l2tp_dispatch_incoming(
@@ -718,10 +785,21 @@ jobs:
                 return -1;
               }
 
+              if (control_rc ==
+                  L2TP_DISPATCH_ERROR) {
+
+                tunnel_engine_log(
+                    ANDROID_LOG_WARN,
+                    LOG_TAG,
+                    "ppp recv: L2TP control dispatch returned error"
+                );
+              }
+
               continue;
             }
 
             if (plen < 6u) {
+
               tunnel_engine_log(
                   ANDROID_LOG_WARN,
                   LOG_TAG,
@@ -745,18 +823,20 @@ jobs:
               1
           )
 
-          # ------------------------------------------------------------
-          # Update every recv_ppp call to pass peer + peer_len
-          # ------------------------------------------------------------
+          # ----------------------------------------------------------
+          # B5. Update every recv_ppp() call
+          # ----------------------------------------------------------
 
           old_call = (
               "recv_ppp(esp_fd, esp, l2tp,"
           )
 
-          count = s.count(old_call)
+          count = s.count(
+              old_call
+          )
 
           assert count >= 5, (
-              f"Expected several recv_ppp calls, found {count}"
+              f"Expected multiple recv_ppp calls, found {count}"
           )
 
           s = s.replace(
@@ -771,14 +851,20 @@ jobs:
           )
           PY
 
+      # ==============================================================
+      # Check patches before spending time compiling
+      # ==============================================================
+
       - name: Verify SPMS patches
         run: |
-          echo "=== IKE / DH2 ==="
+          echo "===== DH2 ====="
+
           grep -n \
             "IKE_DH_PUBKEY_BYTES 128" \
             android/app/src/main/cpp/ikev1.c
 
-          echo "=== Preserve SA ==="
+          echo "===== RESPONDER-LIFETIME ====="
+
           grep -n \
             "preserving original SA" \
             android/app/src/main/cpp/ikev1.c
@@ -787,20 +873,37 @@ jobs:
             "original QM2 received" \
             android/app/src/main/cpp/ikev1.c
 
-          echo "=== No post-ICCN drain ==="
+          echo "===== MODP1024 ====="
+
+          grep -n \
+            "rfc3526_modp2048_p\[128\]" \
+            android/app/src/main/cpp/modp2048_data.c
+
+          echo "===== POST ICCN ====="
+
           grep -n \
             "preserving first post-ICCN packet" \
             android/app/src/main/cpp/l2tp.c
 
-          echo "=== PPP IKE filter ==="
+          echo "===== IKE FILTER ====="
+
           grep -n \
             "IKE packet on UDP/4500 ignored" \
             android/app/src/main/cpp/ppp.c
 
-          echo "=== PPP L2TP control demux ==="
+          grep -n \
+            "bare IKE packet ignored" \
+            android/app/src/main/cpp/ppp.c
+
+          echo "===== L2TP CONTROL DURING PPP ====="
+
           grep -n \
             "processed L2TP control packet" \
             android/app/src/main/cpp/ppp.c
+
+      # ==============================================================
+      # Build environment
+      # ==============================================================
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -846,6 +949,10 @@ jobs:
           echo "flutter.sdk=${flutter_root}" > local.properties
           echo "sdk.dir=${android_sdk_root}" >> local.properties
 
+      # ==============================================================
+      # Compile APK
+      # ==============================================================
+
       - name: Build debug APK
         run: flutter build apk --debug
 
@@ -854,10 +961,14 @@ jobs:
           test -f build/app/outputs/flutter-apk/app-debug.apk
           ls -lh build/app/outputs/flutter-apk/app-debug.apk
 
+      # ==============================================================
+      # Artifact
+      # ==============================================================
+
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-preserve-sa-ppp-control-v8
+          name: tunnel-forge-spms-dh2-preserve-sa-ppp-control-v9
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
