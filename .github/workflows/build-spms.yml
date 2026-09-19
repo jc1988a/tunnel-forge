@@ -18,36 +18,243 @@ jobs:
           repository: NickSimkin/tunnel-forge
           ref: 263ee47dc59dcdb7245dcd80457159e14b76f237
 
-      - name: Patch IKEv1 to DH2
+      - name: Apply SPMS compatibility patches
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          ike = Path("android/app/src/main/cpp/ikev1.c")
-          s = ike.read_text()
+          p = Path("android/app/src/main/cpp/ikev1.c")
+          s = p.read_text()
 
-          assert "#define IKE_DH_PUBKEY_BYTES 256" in s
+          # -------------------------------------------------
+          # 1. IKEv1 Phase 1: DH14/MODP2048 -> DH2/MODP1024
+          # -------------------------------------------------
+
+          old = "#define IKE_DH_PUBKEY_BYTES 256"
+          assert old in s
           s = s.replace(
-              "#define IKE_DH_PUBKEY_BYTES 256",
+              old,
               "#define IKE_DH_PUBKEY_BYTES 128",
               1
           )
 
-          assert "extern const uint8_t rfc3526_modp2048_p[256];" in s
+          old = "extern const uint8_t rfc3526_modp2048_p[256];"
+          assert old in s
           s = s.replace(
-              "extern const uint8_t rfc3526_modp2048_p[256];",
+              old,
               "extern const uint8_t rfc3526_modp2048_p[128];",
               1
           )
 
           dh14 = "0x80, 0x04, 0x00, 0x0e"
           assert s.count(dh14) == 2
+
           s = s.replace(
               dh14,
               "0x80, 0x04, 0x00, 0x02"
           )
 
-          ike.write_text(s)
+          # -------------------------------------------------
+          # 2. Cisco/SPMS RESPONDER-LIFETIME handling
+          # -------------------------------------------------
+
+          start_marker = (
+              '  ike_log_isakmp_summary('
+              '"Quick Mode reply (msg2)", in, inlen);'
+          )
+
+          end_marker = (
+              '  if ((in[19] & IKE_FLAG_ENC) == 0 || '
+              'util_read_be32(in + 20) != qm_mid) {'
+          )
+
+          start = s.index(start_marker)
+          end = s.index(end_marker, start)
+
+          replacement = r'''  int qm_lifetime_retries = 0;
+
+          qm_process_reply:
+            ike_log_isakmp_summary(
+                "Quick Mode reply (msg2)",
+                in,
+                inlen
+            );
+
+            if (in[18] == IKE_EXCH_INFO &&
+                (in[19] & IKE_FLAG_ENC)) {
+
+              uint32_t info_mid =
+                  util_read_be32(in + 20);
+
+              size_t info_enc_len =
+                  (size_t)inlen - 28;
+
+              int saw_responder_lifetime = 0;
+              int saw_other_notify = 0;
+
+              if (info_enc_len >= 8) {
+
+                uint8_t info_plain[256];
+                size_t info_plain_len = 0;
+                uint8_t info_iv_out[16];
+                uint8_t info_iv[16];
+
+                int dec_ok = -1;
+
+                if (ike->p1_aes) {
+
+                  if (info_enc_len >= 16) {
+                    qm_first_iv_aes(
+                        p1_last_block,
+                        info_mid,
+                        info_iv
+                    );
+
+                    dec_ok = isakmp_aes128_decrypt(
+                        aeskey,
+                        info_iv,
+                        in + 28,
+                        info_enc_len,
+                        info_plain,
+                        &info_plain_len,
+                        info_iv_out
+                    );
+                  }
+
+                } else {
+
+                  uint8_t iv8[8];
+
+                  qm_first_iv_sha1(
+                      p1_last_block,
+                      info_mid,
+                      iv8
+                  );
+
+                  memcpy(
+                      info_iv,
+                      iv8,
+                      8
+                  );
+
+                  dec_ok = isakmp_3des_decrypt(
+                      deskey,
+                      info_iv,
+                      in + 28,
+                      info_enc_len,
+                      info_plain,
+                      &info_plain_len,
+                      info_iv_out
+                  );
+                }
+
+                if (dec_ok == 0) {
+
+                  uint8_t info_np = in[16];
+                  size_t w = 0;
+
+                  while (w + 4 <= info_plain_len &&
+                         info_np != IKE_PT_NONE) {
+
+                    uint16_t pl =
+                        util_read_be16(
+                            info_plain + w + 2
+                        );
+
+                    if (pl < 4 ||
+                        w + pl > info_plain_len) {
+                      break;
+                    }
+
+                    if (info_np == IKE_PT_NOTIFY &&
+                        pl >= 12) {
+
+                      uint16_t ntype =
+                          util_read_be16(
+                              info_plain +
+                              w +
+                              4 +
+                              6
+                          );
+
+                      if (ntype == 24576u) {
+
+                        saw_responder_lifetime = 1;
+
+                        tunnel_engine_log(
+                            ANDROID_LOG_INFO,
+                            LOG_TAG,
+                            "Quick Mode: RESPONDER-LIFETIME received"
+                        );
+
+                      } else {
+
+                        saw_other_notify = 1;
+
+                        tunnel_engine_log(
+                            ANDROID_LOG_ERROR,
+                            LOG_TAG,
+                            "Quick Mode: NOTIFY type=%u (0x%04x)",
+                            (unsigned)ntype,
+                            (unsigned)ntype
+                        );
+                      }
+                    }
+
+                    info_np = info_plain[w];
+                    w += pl;
+                  }
+                }
+              }
+
+              if (saw_responder_lifetime &&
+                  !saw_other_notify &&
+                  qm_lifetime_retries < 3) {
+
+                qm_lifetime_retries++;
+
+                tunnel_engine_log(
+                    ANDROID_LOG_INFO,
+                    LOG_TAG,
+                    "Quick Mode: RESPONDER-LIFETIME advisory; retrying QM1 (%d/3)",
+                    qm_lifetime_retries
+                );
+
+                inlen = ike_send_recv(
+                    fd,
+                    (struct sockaddr *)&peer_active,
+                    peer_active_len,
+                    pkt,
+                    o,
+                    in,
+                    sizeof(in),
+                    10000,
+                    prefix
+                );
+
+                if (inlen >= 28) {
+                  goto qm_process_reply;
+                }
+              }
+
+              tunnel_engine_log(
+                  ANDROID_LOG_ERROR,
+                  LOG_TAG,
+                  "Quick Mode: Informational Exchange could not be continued"
+              );
+
+              goto fail_fd;
+            }
+
+          '''
+
+          s = s[:start] + replacement + s[end:]
+
+          p.write_text(s)
+
+          # -------------------------------------------------
+          # 3. RFC 2409 Oakley Group 2 prime
+          # -------------------------------------------------
 
           prime_hex = (
               "FFFFFFFFFFFFFFFFC90FDAA22168C234"
@@ -61,6 +268,7 @@ jobs:
           )
 
           prime = bytes.fromhex(prime_hex)
+
           assert len(prime) == 128
 
           lines = [
@@ -72,13 +280,16 @@ jobs:
 
           for i in range(0, 128, 16):
               chunk = ", ".join(
-                  f"0x{x:02x}" for x in prime[i:i + 16]
+                  f"0x{x:02x}"
+                  for x in prime[i:i + 16]
               )
 
               if i < 112:
                   chunk += ","
 
-              lines.append("    " + chunk)
+              lines.append(
+                  "    " + chunk
+              )
 
           lines.append("};")
 
@@ -88,110 +299,65 @@ jobs:
               "\n".join(lines) + "\n"
           )
 
-          print("SPMS DH2 patch applied")
+          print("SPMS DH2 + RESPONDER-LIFETIME patches applied successfully")
           PY
 
-      - name: Handle Cisco RESPONDER-LIFETIME
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          flutter-version: "3.41.2"
+          channel: stable
+          cache: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: android/gvisor/go.mod
+          cache: true
+          cache-dependency-path: android/gvisor/go.sum
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Download Go dependencies
+        working-directory: android/gvisor
+        run: go mod download
+
+      - name: Create Android local.properties
+        working-directory: android
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          flutter_root="${FLUTTER_ROOT:-$(dirname "$(dirname "$(command -v flutter)")")}"
+          android_sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 
-          p = Path("android/app/src/main/cpp/ikev1.c")
-          s = p.read_text()
+          if [[ -z "${android_sdk_root}" ]]; then
+            echo "Android SDK not found"
+            exit 1
+          fi
 
-          marker = '''  ike_log_isakmp_summary("Quick Mode reply (msg2)", in, inlen);
+          echo "flutter.sdk=${flutter_root}" > local.properties
+          echo "sdk.dir=${android_sdk_root}" >> local.properties
 
-          if (in[18] == IKE_EXCH_INFO && (in[19] & IKE_FLAG_ENC)) {
-          '''
+      - name: Build debug APK
+        run: flutter build apk --debug
 
-          replacement = '''  int qm_lifetime_status_retries = 0;
+      - name: Verify APK
+        run: |
+          test -f build/app/outputs/flutter-apk/app-debug.apk
+          ls -lh build/app/outputs/flutter-apk/app-debug.apk
 
-          qm_process_reply:
-          ike_log_isakmp_summary("Quick Mode reply (msg2)", in, inlen);
-
-          if (in[18] == IKE_EXCH_INFO && (in[19] & IKE_FLAG_ENC)) {
-            int saw_responder_lifetime = 0;
-            int saw_other_notify = 0;
-          '''
-
-          assert marker in s, "Quick Mode entry marker not found"
-          s = s.replace(
-              marker,
-              replacement,
-              1
-          )
-
-          marker = '''        if (info_np == IKE_PT_NOTIFY && pl >= 12) {
-                    uint16_t ntype = util_read_be16(info_plain + w + 4 + 6);
-                    tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG,
-                                      "Quick Mode: server sent NOTIFY type=%u (0x%04x) - proposal rejected", (unsigned)ntype,
-                                      (unsigned)ntype);
-                  }
-          '''
-
-          replacement = '''        if (info_np == IKE_PT_NOTIFY && pl >= 12) {
-                    uint16_t ntype =
-                        util_read_be16(info_plain + w + 4 + 6);
-
-                    if (ntype == 24576u) {
-                      saw_responder_lifetime = 1;
-
-                      tunnel_engine_log(
-                          ANDROID_LOG_INFO,
-                          LOG_TAG,
-                          "Quick Mode: RESPONDER-LIFETIME received; continuing");
-                    } else {
-                      saw_other_notify = 1;
-
-                      tunnel_engine_log(
-                          ANDROID_LOG_ERROR,
-                          LOG_TAG,
-                          "Quick Mode: server sent NOTIFY type=%u (0x%04x)",
-                          (unsigned)ntype,
-                          (unsigned)ntype);
-                    }
-                  }
-          '''
-
-          assert marker in s, "Notify parser marker not found"
-          s = s.replace(
-              marker,
-              replacement,
-              1
-          )
-
-          marker = '''    tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG,
-                              "Quick Mode: server replied with Informational Exchange (not QM2); ESP proposal likely rejected");
-              goto fail_fd;
-            }
-          '''
-
-          replacement = '''    if (saw_responder_lifetime &&
-                !saw_other_notify &&
-                qm_lifetime_status_retries < 3) {
-
-              qm_lifetime_status_retries++;
-
-              tunnel_engine_log(
-                  ANDROID_LOG_INFO,
-                  LOG_TAG,
-                  "Quick Mode: waiting for QM2 after RESPONDER-LIFETIME (try=%d)",
-                  qm_lifetime_status_retries);
-
-              struct pollfd qmpfd = {
-                  .fd = fd,
-                  .events = POLLIN
-              };
-
-              int qmpr = poll(
-                  &qmpfd,
-                  1,
-                  1500
-              );
-
-              if (qmpr > 0 &&
-                  (qmpfd.revents & POLLIN)) {
-
-                ssize_t qmn = recv(
-                    fd,
-                   
+      - name: Upload APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: tunnel-forge-spms-dh2-lifetime-eap-mschapv2
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 14
+          if-no-files-found: error
