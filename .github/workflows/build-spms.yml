@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge DH2 APK
+name: Build SPMS TunnelForge Preserve SA APK
 
 on:
   workflow_dispatch:
@@ -26,37 +26,42 @@ jobs:
           p = Path("android/app/src/main/cpp/ikev1.c")
           s = p.read_text()
 
-          # -------------------------------------------------
-          # 1. IKEv1 Phase 1: DH14/MODP2048 -> DH2/MODP1024
-          # -------------------------------------------------
+          # ============================================================
+          # 1. IKEv1 Phase 1:
+          #    DH14 / MODP2048 -> DH2 / MODP1024
+          # ============================================================
 
           old = "#define IKE_DH_PUBKEY_BYTES 256"
-          assert old in s
-          s = s.replace(
-              old,
-              "#define IKE_DH_PUBKEY_BYTES 128",
-              1
-          )
+          new = "#define IKE_DH_PUBKEY_BYTES 128"
+
+          assert old in s, "IKE_DH_PUBKEY_BYTES marker not found"
+          s = s.replace(old, new, 1)
 
           old = "extern const uint8_t rfc3526_modp2048_p[256];"
-          assert old in s
-          s = s.replace(
-              old,
-              "extern const uint8_t rfc3526_modp2048_p[128];",
-              1
-          )
+          new = "extern const uint8_t rfc3526_modp2048_p[128];"
+
+          assert old in s, "MODP extern marker not found"
+          s = s.replace(old, new, 1)
 
           dh14 = "0x80, 0x04, 0x00, 0x0e"
-          assert s.count(dh14) == 2
+          dh2 = "0x80, 0x04, 0x00, 0x02"
 
-          s = s.replace(
-              dh14,
-              "0x80, 0x04, 0x00, 0x02"
+          assert s.count(dh14) == 2, (
+              f"Expected 2 DH14 attributes, found {s.count(dh14)}"
           )
 
-          # -------------------------------------------------
-          # 2. Cisco/SPMS RESPONDER-LIFETIME handling
-          # -------------------------------------------------
+          s = s.replace(dh14, dh2)
+
+          # ============================================================
+          # 2. Quick Mode / Cisco RESPONDER-LIFETIME
+          #
+          #    Important:
+          #    - 24576 / 0x6000 = RESPONDER-LIFETIME
+          #    - treat it as advisory status
+          #    - DO NOT retransmit QM1
+          #    - preserve original qm_mid / SA
+          #    - wait for the matching original QM2
+          # ============================================================
 
           start_marker = (
               '  ike_log_isakmp_summary('
@@ -68,50 +73,100 @@ jobs:
               'util_read_be32(in + 20) != qm_mid) {'
           )
 
+          assert start_marker in s, (
+              "Quick Mode start marker not found"
+          )
+
           start = s.index(start_marker)
+
+          assert end_marker in s[start:], (
+              "Quick Mode end marker not found"
+          )
+
           end = s.index(end_marker, start)
 
-          replacement = r'''  int qm_lifetime_retries = 0;
+          replacement = r'''  ike_log_isakmp_summary(
+              "Quick Mode reply (msg2)",
+              in,
+              inlen
+          );
 
-          qm_process_reply:
-            ike_log_isakmp_summary(
-                "Quick Mode reply (msg2)",
-                in,
-                inlen
-            );
+          /*
+           * Some Cisco-style L2TP/IPsec gateways send an encrypted
+           * Informational Exchange containing RESPONDER-LIFETIME
+           * (24576 / 0x6000) while Quick Mode is being established.
+           *
+           * This is advisory status, not a Phase-2 rejection.
+           *
+           * Do not retransmit QM1 here. A retransmitted QM1 can create
+           * another Phase-2 SA and lead to inbound ESP SPI mismatch.
+           *
+           * Instead, preserve the original qm_mid / SPI / SA and wait
+           * for its corresponding encrypted QM2.
+           */
+          if (in[18] == IKE_EXCH_INFO &&
+              (in[19] & IKE_FLAG_ENC)) {
 
-            if (in[18] == IKE_EXCH_INFO &&
-                (in[19] & IKE_FLAG_ENC)) {
+            uint32_t info_mid =
+                util_read_be32(in + 20);
 
-              uint32_t info_mid =
-                  util_read_be32(in + 20);
+            size_t info_enc_len =
+                (size_t)inlen - 28;
 
-              size_t info_enc_len =
-                  (size_t)inlen - 28;
+            int saw_responder_lifetime = 0;
+            int saw_other_notify = 0;
 
-              int saw_responder_lifetime = 0;
-              int saw_other_notify = 0;
+            if (info_enc_len >= 8) {
 
-              if (info_enc_len >= 8) {
+              uint8_t info_plain[256];
+              size_t info_plain_len = 0;
 
-                uint8_t info_plain[256];
-                size_t info_plain_len = 0;
-                uint8_t info_iv_out[16];
-                uint8_t info_iv[16];
+              uint8_t info_iv[16];
+              uint8_t info_iv_out[16];
 
-                int dec_ok = -1;
+              int info_decrypt_ok = -1;
 
-                if (ike->p1_aes) {
+              if (ike->p1_aes) {
 
-                  if (info_enc_len >= 16) {
-                    qm_first_iv_aes(
-                        p1_last_block,
-                        info_mid,
-                        info_iv
-                    );
+                if (info_enc_len >= 16) {
 
-                    dec_ok = isakmp_aes128_decrypt(
-                        aeskey,
+                  qm_first_iv_aes(
+                      p1_last_block,
+                      info_mid,
+                      info_iv
+                  );
+
+                  info_decrypt_ok =
+                      isakmp_aes128_decrypt(
+                          aeskey,
+                          info_iv,
+                          in + 28,
+                          info_enc_len,
+                          info_plain,
+                          &info_plain_len,
+                          info_iv_out
+                      );
+                }
+
+              } else {
+
+                uint8_t iv8[8];
+
+                qm_first_iv_sha1(
+                    p1_last_block,
+                    info_mid,
+                    iv8
+                );
+
+                memcpy(
+                    info_iv,
+                    iv8,
+                    8
+                );
+
+                info_decrypt_ok =
+                    isakmp_3des_decrypt(
+                        deskey,
                         info_iv,
                         in + 28,
                         info_enc_len,
@@ -119,132 +174,281 @@ jobs:
                         &info_plain_len,
                         info_iv_out
                     );
+              }
+
+              if (info_decrypt_ok == 0) {
+
+                uint8_t info_np = in[16];
+                size_t w = 0;
+
+                while (w + 4 <= info_plain_len &&
+                       info_np != IKE_PT_NONE) {
+
+                  uint16_t pl =
+                      util_read_be16(
+                          info_plain + w + 2
+                      );
+
+                  if (pl < 4 ||
+                      w + pl > info_plain_len) {
+                    break;
                   }
 
-                } else {
+                  if (info_np == IKE_PT_NOTIFY &&
+                      pl >= 12) {
 
-                  uint8_t iv8[8];
-
-                  qm_first_iv_sha1(
-                      p1_last_block,
-                      info_mid,
-                      iv8
-                  );
-
-                  memcpy(
-                      info_iv,
-                      iv8,
-                      8
-                  );
-
-                  dec_ok = isakmp_3des_decrypt(
-                      deskey,
-                      info_iv,
-                      in + 28,
-                      info_enc_len,
-                      info_plain,
-                      &info_plain_len,
-                      info_iv_out
-                  );
-                }
-
-                if (dec_ok == 0) {
-
-                  uint8_t info_np = in[16];
-                  size_t w = 0;
-
-                  while (w + 4 <= info_plain_len &&
-                         info_np != IKE_PT_NONE) {
-
-                    uint16_t pl =
+                    uint16_t ntype =
                         util_read_be16(
-                            info_plain + w + 2
+                            info_plain +
+                            w +
+                            4 +
+                            6
                         );
 
-                    if (pl < 4 ||
-                        w + pl > info_plain_len) {
-                      break;
+                    if (ntype == 24576u) {
+
+                      saw_responder_lifetime = 1;
+
+                      tunnel_engine_log(
+                          ANDROID_LOG_INFO,
+                          LOG_TAG,
+                          "Quick Mode: RESPONDER-LIFETIME received; preserving original SA"
+                      );
+
+                    } else {
+
+                      saw_other_notify = 1;
+
+                      tunnel_engine_log(
+                          ANDROID_LOG_ERROR,
+                          LOG_TAG,
+                          "Quick Mode: unexpected NOTIFY type=%u (0x%04x)",
+                          (unsigned)ntype,
+                          (unsigned)ntype
+                      );
                     }
-
-                    if (info_np == IKE_PT_NOTIFY &&
-                        pl >= 12) {
-
-                      uint16_t ntype =
-                          util_read_be16(
-                              info_plain +
-                              w +
-                              4 +
-                              6
-                          );
-
-                      if (ntype == 24576u) {
-
-                        saw_responder_lifetime = 1;
-
-                        tunnel_engine_log(
-                            ANDROID_LOG_INFO,
-                            LOG_TAG,
-                            "Quick Mode: RESPONDER-LIFETIME received"
-                        );
-
-                      } else {
-
-                        saw_other_notify = 1;
-
-                        tunnel_engine_log(
-                            ANDROID_LOG_ERROR,
-                            LOG_TAG,
-                            "Quick Mode: NOTIFY type=%u (0x%04x)",
-                            (unsigned)ntype,
-                            (unsigned)ntype
-                        );
-                      }
-                    }
-
-                    info_np = info_plain[w];
-                    w += pl;
                   }
+
+                  info_np = info_plain[w];
+                  w += pl;
                 }
               }
+            }
 
-              if (saw_responder_lifetime &&
-                  !saw_other_notify &&
-                  qm_lifetime_retries < 3) {
-
-                qm_lifetime_retries++;
-
-                tunnel_engine_log(
-                    ANDROID_LOG_INFO,
-                    LOG_TAG,
-                    "Quick Mode: RESPONDER-LIFETIME advisory; retrying QM1 (%d/3)",
-                    qm_lifetime_retries
-                );
-
-                inlen = ike_send_recv(
-                    fd,
-                    (struct sockaddr *)&peer_active,
-                    peer_active_len,
-                    pkt,
-                    o,
-                    in,
-                    sizeof(in),
-                    10000,
-                    prefix
-                );
-
-                if (inlen >= 28) {
-                  goto qm_process_reply;
-                }
-              }
+            if (!saw_responder_lifetime ||
+                saw_other_notify) {
 
               tunnel_engine_log(
                   ANDROID_LOG_ERROR,
                   LOG_TAG,
-                  "Quick Mode: Informational Exchange could not be continued"
+                  "Quick Mode: Informational Exchange is not a clean RESPONDER-LIFETIME advisory"
               );
 
               goto fail_fd;
             }
+
+            tunnel_engine_log(
+                ANDROID_LOG_INFO,
+                LOG_TAG,
+                "Quick Mode: waiting for original QM2 without retransmitting QM1"
+            );
+
+            int qm_waited_ms = 0;
+            int qm2_received = 0;
+
+            while (qm_waited_ms < 20000) {
+
+              if (tunnel_should_stop()) {
+
+                tunnel_engine_log(
+                    ANDROID_LOG_INFO,
+                    LOG_TAG,
+                    "Quick Mode: canceled while waiting for original QM2"
+                );
+
+                goto fail_fd;
+              }
+
+              struct pollfd qmpfd = {
+                  .fd = fd,
+                  .events = POLLIN
+              };
+
+              int qmpr = poll(
+                  &qmpfd,
+                  1,
+                  500
+              );
+
+              if (qmpr < 0) {
+
+                if (errno == EINTR) {
+                  continue;
+                }
+
+                tunnel_engine_log(
+                    ANDROID_LOG_ERROR,
+                    LOG_TAG,
+                    "Quick Mode: poll failed while waiting for QM2 errno=%d",
+                    errno
+                );
+
+                goto fail_fd;
+              }
+
+              qm_waited_ms += 500;
+
+              if (qmpr == 0) {
+                continue;
+              }
+
+              if ((qmpfd.revents & POLLIN) == 0) {
+                continue;
+              }
+
+              ssize_t qmn = recv(
+                  fd,
+                  in,
+                  sizeof(in),
+                  0
+              );
+
+              if (qmn <= 0) {
+
+                if (errno == EINTR) {
+                  continue;
+                }
+
+                continue;
+              }
+
+              /*
+               * UDP 4500:
+               *
+               * IKE:
+               *   00 00 00 00 + ISAKMP
+               *
+               * ESP:
+               *   starts directly with SPI
+               *
+               * Do not interpret ESP bytes as an IKE packet.
+               */
+              if (prefix) {
+
+                if (qmn < 4 ||
+                    util_read_be32(in) != 0u) {
+
+                  if (qmn >= 4) {
+
+                    uint32_t early_spi =
+                        util_read_be32(in);
+
+                    tunnel_engine_log(
+                        ANDROID_LOG_DEBUG,
+                        LOG_TAG,
+                        "Quick Mode: early ESP while waiting for QM2 spi=%08x; ignored without changing SA",
+                        (unsigned)early_spi
+                    );
+                  }
+
+                  continue;
+                }
+
+                memmove(
+                    in,
+                    in + 4,
+                    (size_t)qmn - 4u
+                );
+
+                qmn -= 4;
+              }
+
+              if (qmn < 28) {
+                continue;
+              }
+
+              /*
+               * Verify basic ISAKMP framing.
+               */
+              if (in[17] != 0x10) {
+                continue;
+              }
+
+              uint32_t ike_len =
+                  util_read_be32(in + 24);
+
+              if (ike_len != (uint32_t)qmn) {
+                continue;
+              }
+
+              uint8_t exchange = in[18];
+              uint8_t flags = in[19];
+              uint32_t message_id =
+                  util_read_be32(in + 20);
+
+              /*
+               * Another informational status packet:
+               * ignore it and continue waiting.
+               */
+              if (exchange == IKE_EXCH_INFO &&
+                  (flags & IKE_FLAG_ENC)) {
+
+                tunnel_engine_log(
+                    ANDROID_LOG_INFO,
+                    LOG_TAG,
+                    "Quick Mode: additional encrypted Informational Exchange ignored while preserving SA"
+                );
+
+                continue;
+              }
+
+              /*
+               * We only accept the encrypted Quick Mode response
+               * for the original message ID.
+               */
+              if (exchange == IKE_EXCH_QUICK &&
+                  (flags & IKE_FLAG_ENC) &&
+                  message_id == qm_mid) {
+
+                inlen = (int)qmn;
+                qm2_received = 1;
+
+                tunnel_engine_log(
+                    ANDROID_LOG_INFO,
+                    LOG_TAG,
+                    "Quick Mode: original QM2 received after RESPONDER-LIFETIME"
+                );
+
+                break;
+              }
+
+              tunnel_engine_log(
+                  ANDROID_LOG_DEBUG,
+                  LOG_TAG,
+                  "Quick Mode: unrelated IKE packet ignored exchange=%u mid=%u expected_mid=%u",
+                  (unsigned)exchange,
+                  (unsigned)message_id,
+                  (unsigned)qm_mid
+              );
+            }
+
+            if (!qm2_received) {
+
+              tunnel_engine_log(
+                  ANDROID_LOG_ERROR,
+                  LOG_TAG,
+                  "Quick Mode: timeout waiting for original QM2 after RESPONDER-LIFETIME"
+              );
+
+              goto fail_fd;
+            }
+
+            ike_log_isakmp_summary(
+                "Quick Mode original msg2 after RESPONDER-LIFETIME",
+                in,
+                inlen
+            );
+          }
 
           '''
 
@@ -252,9 +456,9 @@ jobs:
 
           p.write_text(s)
 
-          # -------------------------------------------------
-          # 3. RFC 2409 Oakley Group 2 prime
-          # -------------------------------------------------
+          # ============================================================
+          # 3. RFC 2409 Oakley Group 2 prime / MODP1024
+          # ============================================================
 
           prime_hex = (
               "FFFFFFFFFFFFFFFFC90FDAA22168C234"
@@ -279,6 +483,7 @@ jobs:
           ]
 
           for i in range(0, 128, 16):
+
               chunk = ", ".join(
                   f"0x{x:02x}"
                   for x in prime[i:i + 16]
@@ -299,8 +504,28 @@ jobs:
               "\n".join(lines) + "\n"
           )
 
-          print("SPMS DH2 + RESPONDER-LIFETIME patches applied successfully")
+          print(
+              "SPMS patches applied: DH2 + preserve original Quick Mode SA"
+          )
           PY
+
+      - name: Verify SPMS patches
+        run: |
+          grep -n \
+            "IKE_DH_PUBKEY_BYTES 128" \
+            android/app/src/main/cpp/ikev1.c
+
+          grep -n \
+            "preserving original SA" \
+            android/app/src/main/cpp/ikev1.c
+
+          grep -n \
+            "original QM2 received" \
+            android/app/src/main/cpp/ikev1.c
+
+          grep -n \
+            "rfc3526_modp2048_p\[128\]" \
+            android/app/src/main/cpp/modp2048_data.c
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -357,7 +582,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-lifetime-eap-mschapv2
+          name: tunnel-forge-spms-dh2-preserve-sa-eap-mschapv2
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
