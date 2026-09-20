@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge PPP LCP APK
+name: Build SPMS TunnelForge PPP LCP ICCN APK
 
 on:
   workflow_dispatch:
@@ -452,6 +452,107 @@ jobs:
           PY
 
       # ==============================================================
+      # RFC 2661 ICCN mandatory AVPs
+      # ==============================================================
+
+      - name: Patch RFC2661 ICCN mandatory AVPs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/cpp/l2tp.c")
+          s = p.read_text()
+
+          old = '''  ao = 0;
+            avp_u16(avps, &ao, L2TP_AVP_MSG_TYPE, L2TP_MSG_ICCN);
+            avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_SESSION, local_sid);
+            if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
+              return -1;'''
+
+          new = '''  ao = 0;
+
+            /*
+             * RFC 2661 section 6.8:
+             * ICCN MUST contain Message Type, Tx Connect Speed
+             * and Framing Type.
+             */
+
+            avp_u16(
+                avps,
+                &ao,
+                L2TP_AVP_MSG_TYPE,
+                L2TP_MSG_ICCN
+            );
+
+            /*
+             * Attribute 24 = (Tx) Connect Speed.
+             * Use 10 Mbps, a conventional virtual-link value.
+             */
+            if (l2tp_avp_append_u32(
+                    avps,
+                    sizeof(avps),
+                    &ao,
+                    24,
+                    10000000u
+                ) != 0) {
+
+              return -1;
+            }
+
+            /*
+             * Attribute 19 = Framing Type.
+             * 1 = synchronous framing, already advertised in SCCRQ.
+             */
+            if (l2tp_avp_append_u32(
+                    avps,
+                    sizeof(avps),
+                    &ao,
+                    19,
+                    1u
+                ) != 0) {
+
+              return -1;
+            }
+
+            tunnel_engine_log(
+                ANDROID_LOG_INFO,
+                LOG_TAG,
+                "l2tp ICCN: RFC2661 mandatory AVPs tx_speed=10000000 framing=sync"
+            );
+
+            if (send_ctrl(
+                    esp_fd,
+                    esp,
+                    peer,
+                    peer_len,
+                    s,
+                    avps,
+                    ao
+                ) != 0) {
+
+              return -1;
+            }'''
+
+          count = s.count(old)
+
+          assert count == 1, (
+              f"Expected exactly one original ICCN block, found {count}"
+          )
+
+          s = s.replace(
+              old,
+              new,
+              1
+          )
+
+          p.write_text(s)
+
+          print(
+              "RFC2661 ICCN mandatory AVPs patch applied successfully"
+          )
+          PY
+
+      # ==============================================================
       # L2TP / PPP transition
       # ==============================================================
 
@@ -847,18 +948,6 @@ jobs:
 
       # ==============================================================
       # PPP LCP compatibility
-      #
-      # SPMS response observed:
-      #
-      #   c0 21 04 01 00 0e
-      #   01 04 05 aa
-      #   02 06 00 00 00 00
-      #
-      # = Configure-Reject:
-      #   option 1 MRU
-      #   option 2 ACCM
-      #
-      # TunnelForge already handled ACCM rejection but not MRU.
       # ==============================================================
 
       - name: Patch PPP LCP MRU rejection handling
@@ -1034,7 +1123,7 @@ jobs:
           )
 
           # ----------------------------------------------------------
-          # 7. Update the remaining 3 lcp_build_cr() calls
+          # 7. Update remaining 3 lcp_build_cr() calls
           # ----------------------------------------------------------
 
           old = (
@@ -1149,7 +1238,7 @@ jobs:
           PY
 
       # ==============================================================
-      # Sanity checks before expensive build
+      # Sanity checks before build
       # ==============================================================
 
       - name: Verify SPMS patches
@@ -1177,6 +1266,16 @@ jobs:
           grep -n \
             "rfc3526_modp2048_p\[128\]" \
             android/app/src/main/cpp/modp2048_data.c
+
+          echo "===== ICCN RFC2661 AVPS ====="
+
+          grep -n \
+            "l2tp ICCN: RFC2661 mandatory AVPs" \
+            android/app/src/main/cpp/l2tp.c
+
+          grep -n \
+            "10000000u" \
+            android/app/src/main/cpp/l2tp.c
 
           echo "===== POST ICCN ====="
 
@@ -1293,7 +1392,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-preserve-sa-ppp-lcp-v11
+          name: tunnel-forge-spms-dh2-preserve-sa-ppp-lcp-iccn-v12
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
