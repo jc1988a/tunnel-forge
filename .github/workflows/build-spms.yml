@@ -1218,7 +1218,6 @@ jobs:
       # ==============================================================
       # V19 MS-CHAPv2 identity compatibility
       # ==============================================================
-
       - name: Patch MSCHAPv2 SPMS identity compatibility
         run: |
           python3 - <<'PY'
@@ -1238,8 +1237,13 @@ jobs:
               "static int ppp_send_eap("
           )
 
-          assert s.count(func_start_marker) == 1
-          assert s.count(func_end_marker) == 1
+          assert s.count(func_start_marker) == 1, (
+              "Expected exactly one ppp_auth_mschapv2 function"
+          )
+
+          assert s.count(func_end_marker) == 1, (
+              "Expected exactly one ppp_send_eap marker"
+          )
 
           func_start = s.index(
               func_start_marker
@@ -1254,19 +1258,25 @@ jobs:
               func_start:func_end
           ]
 
+          # ==========================================================
+          # 1. Insert normalized SPMS identity
+          # ==========================================================
+
           identity_marker = (
               "    uint8_t peer_chal[16];"
           )
 
-          assert fn.count(identity_marker) == 1
+          assert fn.count(identity_marker) == 1, (
+              "Expected exactly one peer_chal marker"
+          )
 
           identity_code = r'''    /*
-             * SPMS V19 identity compatibility.
+             * SPMS identity compatibility.
              *
              * DOMAIN\user -> user
              * user@realm  -> user
              *
-             * Username contents are never logged.
+             * Username contents are not logged.
              */
             char spms_user[256];
 
@@ -1357,6 +1367,10 @@ jobs:
               1
           )
 
+          # ==========================================================
+          # 2. Use normalized identity in ChallengeHash calculation
+          # ==========================================================
+
           old_response_call = (
               "    if (ppp_mschapv2_response_value("
               "user, password, auth_chal, "
@@ -1371,7 +1385,9 @@ jobs:
 
           assert fn.count(
               old_response_call
-          ) == 1
+          ) == 1, (
+              "MS-CHAPv2 response calculation marker mismatch"
+          )
 
           fn = fn.replace(
               old_response_call,
@@ -1379,43 +1395,75 @@ jobs:
               1
           )
 
-          old_name_block = '''    size_t ulen = strlen(user);
-            memcpy(out + o, user, ulen);
-            o += ulen;'''
+          # ==========================================================
+          # 3. Replace CHAP Response Name block POSITIONALLY
+          #
+          # No multiline exact matching.
+          # ==========================================================
 
-          new_name_block = '''    size_t ulen =
-                strlen(spms_user);
+          name_start_marker = (
+              "    size_t ulen = strlen(user);"
+          )
 
-            if (o + ulen >
-                sizeof(out)) {
-
-              tunnel_engine_log(
-                  ANDROID_LOG_ERROR,
-                  LOG_TAG,
-                  "ppp auth: MS-CHAPv2 response username too long effective_len=%zu",
-                  ulen
-              );
-
-              return -1;
-            }
-
-            memcpy(
-                out + o,
-                spms_user,
-                ulen
-            );
-
-            o += ulen;'''
+          name_end_marker = (
+              "    o += ulen;"
+          )
 
           assert fn.count(
-              old_name_block
-          ) == 1
-
-          fn = fn.replace(
-              old_name_block,
-              new_name_block,
-              1
+              name_start_marker
+          ) == 1, (
+              "Expected exactly one username block start"
           )
+
+          assert fn.count(
+              name_end_marker
+          ) == 1, (
+              "Expected exactly one username block end"
+          )
+
+          name_start = fn.index(
+              name_start_marker
+          )
+
+          name_end = (
+              fn.index(
+                  name_end_marker,
+                  name_start
+              )
+              + len(name_end_marker)
+          )
+
+          name_replacement = (
+              "    size_t ulen = strlen(spms_user);\n"
+              "\n"
+              "    if (o + ulen > sizeof(out)) {\n"
+              "      tunnel_engine_log(\n"
+              "          ANDROID_LOG_ERROR,\n"
+              "          LOG_TAG,\n"
+              "          \"ppp auth: MS-CHAPv2 response username too long effective_len=%zu\",\n"
+              "          ulen\n"
+              "      );\n"
+              "      return -1;\n"
+              "    }\n"
+              "\n"
+              "    memcpy(\n"
+              "        out + o,\n"
+              "        spms_user,\n"
+              "        ulen\n"
+              "    );\n"
+              "\n"
+              "    o += ulen;"
+          )
+
+          fn = (
+              fn[:name_start]
+              + name_replacement
+              + fn[name_end:]
+          )
+
+          # ==========================================================
+          # 4. Hard verification
+          # ==========================================================
 
           assert (
               "identity mode=local-account"
@@ -1426,6 +1474,14 @@ jobs:
               "spms_user, password"
           ) in fn
 
+          assert (
+              "size_t ulen = strlen(spms_user);"
+          ) in fn
+
+          assert (
+              "size_t ulen = strlen(user);"
+          ) not in fn
+
           s = (
               s[:func_start]
               + fn
@@ -1435,10 +1491,9 @@ jobs:
           p.write_text(s)
 
           print(
-              "SPMS MS-CHAPv2 V19 identity compatibility applied successfully"
+              "SPMS MS-CHAPv2 V20 identity compatibility applied successfully"
           )
           PY
-
       # ==============================================================
       # V19 Failure diagnostic
       # ==============================================================
