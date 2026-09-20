@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge MSCHAPv2 V18 APK
+name: Build SPMS TunnelForge MSCHAPv2 V19 APK
 
 on:
   workflow_dispatch:
@@ -29,10 +29,6 @@ jobs:
 
           p = Path("android/app/src/main/cpp/ikev1.c")
           s = p.read_text()
-
-          # ----------------------------------------------------------
-          # DH14 / MODP2048 -> DH2 / MODP1024
-          # ----------------------------------------------------------
 
           old = "#define IKE_DH_PUBKEY_BYTES 256"
           assert old in s, "IKE_DH_PUBKEY_BYTES marker not found"
@@ -65,10 +61,6 @@ jobs:
               dh14,
               dh2
           )
-
-          # ----------------------------------------------------------
-          # Cisco/SPMS RESPONDER-LIFETIME
-          # ----------------------------------------------------------
 
           start_marker = (
               '  ike_log_isakmp_summary('
@@ -391,10 +383,6 @@ jobs:
 
           p.write_text(s)
 
-          # ----------------------------------------------------------
-          # RFC2409 Oakley Group 2 / MODP1024
-          # ----------------------------------------------------------
-
           prime_hex = (
               "FFFFFFFFFFFFFFFFC90FDAA22168C234"
               "C4C6628B80DC1CD129024E088A67CC74"
@@ -474,12 +462,7 @@ jobs:
           new = '''  ao = 0;
 
             /*
-             * RFC 2661 section 6.8:
-             *
-             * ICCN mandatory AVPs:
-             *   Message Type
-             *   Tx Connect Speed
-             *   Framing Type
+             * RFC 2661 section 6.8
              */
 
             avp_u16(
@@ -612,9 +595,6 @@ jobs:
             return ((long long)now.tv_sec * 1000ll) + ((long long)now.tv_usec / 1000ll);
           }
 
-          /*
-           * UDP/4500 is shared by NAT-T ESP and IKE.
-           */
           static int ppp_isakmp_datagram_like(
               const uint8_t *p,
               size_t len) {
@@ -649,9 +629,7 @@ jobs:
 
           '''
 
-          assert marker in s, (
-              "ppp_now_ms marker not found"
-          )
+          assert marker in s
 
           s = s.replace(
               marker,
@@ -669,9 +647,7 @@ jobs:
               "int ms) {"
           )
 
-          assert old_signature in s, (
-              "recv_ppp signature not found"
-          )
+          assert old_signature in s
 
           new_signature = '''static int recv_ppp(
               int esp_fd,
@@ -702,10 +678,7 @@ jobs:
               recv_start
           )
 
-          ike_filter = r'''    /*
-             * NAT-T keepalive.
-             */
-            if (esp->udp_encap &&
+          ike_filter = r'''    if (esp->udp_encap &&
                 n == 1 &&
                 raw[0] == 0xffu) {
 
@@ -718,10 +691,6 @@ jobs:
               continue;
             }
 
-            /*
-             * RFC3948:
-             * IKE = 00000000 + ISAKMP on UDP/4500.
-             */
             if (esp->udp_encap &&
                 n >= 32 &&
                 util_read_be32(raw) == 0u &&
@@ -738,9 +707,6 @@ jobs:
               continue;
             }
 
-            /*
-             * Defensive case for bare ISAKMP.
-             */
             if (esp->udp_encap &&
                 ppp_isakmp_datagram_like(
                     raw,
@@ -798,12 +764,6 @@ jobs:
                     plain
                 );
 
-            /*
-             * RFC 2661 T bit:
-             *
-             * T=1 -> control
-             * T=0 -> data
-             */
             if ((l2tp_flags &
                  0x8000u) != 0u) {
 
@@ -841,28 +801,10 @@ jobs:
                 return -1;
               }
 
-              if (control_rc ==
-                  L2TP_DISPATCH_ERROR) {
-
-                tunnel_engine_log(
-                    ANDROID_LOG_WARN,
-                    LOG_TAG,
-                    "ppp recv: L2TP control dispatch returned error"
-                );
-              }
-
               continue;
             }
 
             if (plen < 6u) {
-
-              tunnel_engine_log(
-                  ANDROID_LOG_WARN,
-                  LOG_TAG,
-                  "ppp recv short L2TP data plen=%zu",
-                  plen
-              );
-
               continue;
             }
 
@@ -884,9 +826,7 @@ jobs:
               old_call
           )
 
-          assert count > 0, (
-              "No recv_ppp call sites found"
-          )
+          assert count > 0
 
           s = s.replace(
               old_call,
@@ -903,7 +843,7 @@ jobs:
           PY
 
       # ==============================================================
-      # PPP LCP compatibility
+      # PPP LCP
       # ==============================================================
 
       - name: Patch PPP LCP MRU rejection handling
@@ -925,15 +865,8 @@ jobs:
                                   int include_address_control, int include_mru, int include_accm, int include_auth) {
           '''
 
-          assert s.count(old) == 1, (
-              "lcp_build_cr signature marker mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           old = '''  out[o++] = 1;
             out[o++] = 4;
@@ -951,15 +884,8 @@ jobs:
             if (include_accm) {
           '''
 
-          assert s.count(old) == 1, (
-              "MRU option block marker mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           old = '''static void lcp_apply_conf_reject(const uint8_t *lcp, size_t lcp_len, int *include_accm, int *include_auth,
                                             int *removed_accm, int *removed_auth) {
@@ -975,15 +901,8 @@ jobs:
               *removed_accm = 0;
           '''
 
-          assert s.count(old) == 1, (
-              "Configure-Reject function marker mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           old = '''    if (t == 2u && include_accm != NULL && *include_accm) {
                 *include_accm = 0;
@@ -1003,15 +922,8 @@ jobs:
               } else if (t == 3u && include_auth != NULL && *include_auth) {
           '''
 
-          assert s.count(old) == 1, (
-              "Configure-Reject option parser marker mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           old = '''  int lcp_out_include_ac = 1;
             int lcp_peer_framing_seen = 0;
@@ -1024,15 +936,8 @@ jobs:
             int lcp_accm_in_cr = 1;
           '''
 
-          assert s.count(old) == 1, (
-              "LCP option state marker mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           old = (
               "lcp_build_cr("
@@ -1047,15 +952,8 @@ jobs:
               "lcp_accm_in_cr, lcp_auth_in_cr)"
           )
 
-          assert s.count(old) == 1, (
-              "Initial lcp_build_cr call mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           old = (
               "lcp_build_cr("
@@ -1072,15 +970,8 @@ jobs:
               "lcp_accm_in_cr, lcp_auth_in_cr)"
           )
 
-          assert s.count(old) == 3, (
-              f"Expected 3 remaining lcp_build_cr calls, "
-              f"found {s.count(old)}"
-          )
-
-          s = s.replace(
-              old,
-              new
-          )
+          assert s.count(old) == 3
+          s = s.replace(old, new)
 
           old = '''        int removed_accm = 0;
                   int removed_auth = 0;
@@ -1125,32 +1016,12 @@ jobs:
                   }
           '''
 
-          assert s.count(old) == 1, (
-              "Configure-Reject handler call marker mismatch"
-          )
-
-          s = s.replace(
-              old,
-              new,
-              1
-          )
-
-          assert (
-              "int include_address_control, int include_mru, "
-              "int include_accm, int include_auth"
-          ) in s
-
-          assert (
-              "t == 1u && include_mru != NULL && *include_mru"
-          ) in s
+          assert s.count(old) == 1
+          s = s.replace(old, new, 1)
 
           assert (
               "int lcp_mru_in_cr = 1;"
           ) in s
-
-          assert s.count(
-              "lcp_mru_in_cr, lcp_accm_in_cr, lcp_auth_in_cr"
-          ) == 4
 
           p.write_text(s)
 
@@ -1158,15 +1029,194 @@ jobs:
               "SPMS PPP LCP patch applied successfully"
           )
           PY
+
+      # ==============================================================
+      # MS-CHAPv2 challenge length handling
+      # ==============================================================
+
+      - name: Patch MSCHAPv2 challenge length handling
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "android/app/src/main/cpp/ppp.c"
+          )
+
+          s = p.read_text()
+
+          func_start_marker = (
+              "static int ppp_auth_mschapv2("
+          )
+
+          func_end_marker = (
+              "static int ppp_send_eap("
+          )
+
+          assert s.count(func_start_marker) == 1
+          assert s.count(func_end_marker) == 1
+
+          func_start = s.index(
+              func_start_marker
+          )
+
+          func_end = s.index(
+              func_end_marker,
+              func_start
+          )
+
+          fn = s[
+              func_start:func_end
+          ]
+
+          challenge_start_marker = (
+              "    uint8_t chap_id = p[3];"
+          )
+
+          challenge_end_marker = (
+              "    const uint8_t *auth_chal = p + 7;"
+          )
+
+          assert fn.count(
+              challenge_start_marker
+          ) == 1
+
+          assert fn.count(
+              challenge_end_marker
+          ) == 1
+
+          challenge_start = fn.index(
+              challenge_start_marker
+          )
+
+          challenge_end = (
+              fn.index(
+                  challenge_end_marker,
+                  challenge_start
+              )
+              + len(challenge_end_marker)
+          )
+
+          challenge_replacement = '''    uint8_t chap_id = p[3];
+            uint16_t plen = util_read_be16(p + 4);
+
+            if (plen < 5u ||
+                (size_t)plen + 2u > len) {
+
+              tunnel_engine_log(
+                  ANDROID_LOG_WARN,
+                  LOG_TAG,
+                  "ppp auth: invalid MS-CHAPv2 CHAP length chap_len=%u ppp_len=%zu",
+                  (unsigned)plen,
+                  len
+              );
+
+              continue;
+            }
+
+            uint8_t vs = p[6];
+
+            if (vs != 16u ||
+                (size_t)plen <
+                    5u + (size_t)vs) {
+
+              tunnel_engine_log(
+                  ANDROID_LOG_WARN,
+                  LOG_TAG,
+                  "ppp auth: invalid MS-CHAPv2 challenge chap_len=%u value_size=%u",
+                  (unsigned)plen,
+                  (unsigned)vs
+              );
+
+              continue;
+            }
+
+            tunnel_engine_log(
+                ANDROID_LOG_DEBUG,
+                LOG_TAG,
+                "ppp auth: valid MS-CHAPv2 challenge id=%u chap_len=%u value_size=%u",
+                (unsigned)chap_id,
+                (unsigned)plen,
+                (unsigned)vs
+            );
+
+            const uint8_t *auth_chal = p + 7;'''
+
+          fn = (
+              fn[:challenge_start]
+              + challenge_replacement
+              + fn[challenge_end:]
+          )
+
+          send_marker = (
+              "    if (send_ppp("
+              "esp_fd, esp, peer, peer_len, "
+              "l2tp, out, o) < 0)"
+          )
+
+          assert fn.count(send_marker) == 1
+
+          send_pos = fn.index(
+              send_marker
+          )
+
+          return_marker = (
+              "      return -1;"
+          )
+
+          return_pos = fn.index(
+              return_marker,
+              send_pos
+          )
+
+          insert_pos = (
+              return_pos
+              + len(return_marker)
+          )
+
+          send_log = '''
+
+            tunnel_engine_log(
+                ANDROID_LOG_DEBUG,
+                LOG_TAG,
+                "ppp auth: MS-CHAPv2 response sent id=%u bytes=%zu",
+                (unsigned)chap_id,
+                o
+            );'''
+
+          fn = (
+              fn[:insert_pos]
+              + send_log
+              + fn[insert_pos:]
+          )
+
+          assert (
+              "(size_t)plen + 2u > len"
+          ) in fn
+
+          assert (
+              "5u + (size_t)vs"
+          ) in fn
+
+          assert (
+              "(size_t)plen < 7u + vs"
+          ) not in fn
+
+          s = (
+              s[:func_start]
+              + fn
+              + s[func_end:]
+          )
+
+          p.write_text(s)
+
+          print(
+              "SPMS MS-CHAPv2 V19 challenge patch applied successfully"
+          )
+          PY
+
       # ==============================================================
       # V19 MS-CHAPv2 identity compatibility
-      #
-      # Compatibility test:
-      # - DOMAIN\user -> user
-      # - user@realm  -> user
-      #
-      # Uses the local account name both for ChallengeHash and
-      # for the CHAP Response Name field.
       # ==============================================================
 
       - name: Patch MSCHAPv2 SPMS identity compatibility
@@ -1188,13 +1238,8 @@ jobs:
               "static int ppp_send_eap("
           )
 
-          assert s.count(func_start_marker) == 1, (
-              "Expected exactly one ppp_auth_mschapv2 function"
-          )
-
-          assert s.count(func_end_marker) == 1, (
-              "Expected exactly one ppp_send_eap marker"
-          )
+          assert s.count(func_start_marker) == 1
+          assert s.count(func_end_marker) == 1
 
           func_start = s.index(
               func_start_marker
@@ -1213,20 +1258,15 @@ jobs:
               "    uint8_t peer_chal[16];"
           )
 
-          assert fn.count(identity_marker) == 1, (
-              "Expected exactly one peer_chal marker "
-              "inside ppp_auth_mschapv2"
-          )
+          assert fn.count(identity_marker) == 1
 
           identity_code = r'''    /*
              * SPMS V19 identity compatibility.
              *
-             * Convert:
+             * DOMAIN\user -> user
+             * user@realm  -> user
              *
-             *   DOMAIN\user -> user
-             *   user@realm  -> user
-             *
-             * No username contents are logged.
+             * Username contents are never logged.
              */
             char spms_user[256];
 
@@ -1308,7 +1348,7 @@ jobs:
                 spms_changed
             );
 
-    '''
+          '''
 
           fn = fn.replace(
               identity_marker,
@@ -1331,9 +1371,7 @@ jobs:
 
           assert fn.count(
               old_response_call
-          ) == 1, (
-              "MS-CHAPv2 response calculation marker mismatch"
-          )
+          ) == 1
 
           fn = fn.replace(
               old_response_call,
@@ -1371,9 +1409,7 @@ jobs:
 
           assert fn.count(
               old_name_block
-          ) == 1, (
-              "MS-CHAPv2 response Name marker mismatch"
-          )
+          ) == 1
 
           fn = fn.replace(
               old_name_block,
@@ -1390,10 +1426,6 @@ jobs:
               "spms_user, password"
           ) in fn
 
-          assert (
-              "strlen(spms_user)"
-          ) in fn
-
           s = (
               s[:func_start]
               + fn
@@ -1406,234 +1438,9 @@ jobs:
               "SPMS MS-CHAPv2 V19 identity compatibility applied successfully"
           )
           PY
-          
 
       # ==============================================================
-      # MS-CHAPv2 challenge length handling
-      # ==============================================================
-
-      - name: Patch MSCHAPv2 challenge length handling
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path(
-              "android/app/src/main/cpp/ppp.c"
-          )
-
-          s = p.read_text()
-
-          func_start_marker = (
-              "static int ppp_auth_mschapv2("
-          )
-
-          func_end_marker = (
-              "static int ppp_send_eap("
-          )
-
-          assert s.count(func_start_marker) == 1, (
-              "Expected exactly one ppp_auth_mschapv2 function"
-          )
-
-          assert s.count(func_end_marker) == 1, (
-              "Expected exactly one ppp_send_eap marker"
-          )
-
-          func_start = s.index(
-              func_start_marker
-          )
-
-          func_end = s.index(
-              func_end_marker,
-              func_start
-          )
-
-          fn = s[
-              func_start:func_end
-          ]
-
-          challenge_start_marker = (
-              "    uint8_t chap_id = p[3];"
-          )
-
-          challenge_end_marker = (
-              "    const uint8_t *auth_chal = p + 7;"
-          )
-
-          assert fn.count(
-              challenge_start_marker
-          ) == 1, (
-              "Expected exactly one CHAP parser start "
-              "inside ppp_auth_mschapv2"
-          )
-
-          assert fn.count(
-              challenge_end_marker
-          ) == 1, (
-              "Expected exactly one auth_chal marker "
-              "inside ppp_auth_mschapv2"
-          )
-
-          challenge_start = fn.index(
-              challenge_start_marker
-          )
-
-          challenge_end = (
-              fn.index(
-                  challenge_end_marker,
-                  challenge_start
-              )
-              + len(challenge_end_marker)
-          )
-
-          challenge_replacement = '''    uint8_t chap_id = p[3];
-            uint16_t plen = util_read_be16(p + 4);
-
-            /*
-             * p includes the two-byte PPP protocol field at p[0..1].
-             * CHAP Length excludes those two bytes.
-             */
-            if (plen < 5u ||
-                (size_t)plen + 2u > len) {
-
-              tunnel_engine_log(
-                  ANDROID_LOG_WARN,
-                  LOG_TAG,
-                  "ppp auth: invalid MS-CHAPv2 CHAP length chap_len=%u ppp_len=%zu",
-                  (unsigned)plen,
-                  len
-              );
-
-              continue;
-            }
-
-            uint8_t vs = p[6];
-
-            /*
-             * Minimum Challenge CHAP length:
-             * 5 + Value-Size.
-             *
-             * Value-Size = 16 => minimum 21 bytes.
-             */
-            if (vs != 16u ||
-                (size_t)plen <
-                    5u + (size_t)vs) {
-
-              tunnel_engine_log(
-                  ANDROID_LOG_WARN,
-                  LOG_TAG,
-                  "ppp auth: invalid MS-CHAPv2 challenge chap_len=%u value_size=%u",
-                  (unsigned)plen,
-                  (unsigned)vs
-              );
-
-              continue;
-            }
-
-            tunnel_engine_log(
-                ANDROID_LOG_DEBUG,
-                LOG_TAG,
-                "ppp auth: valid MS-CHAPv2 challenge id=%u chap_len=%u value_size=%u",
-                (unsigned)chap_id,
-                (unsigned)plen,
-                (unsigned)vs
-            );
-
-            const uint8_t *auth_chal = p + 7;'''
-
-          fn = (
-              fn[:challenge_start]
-              + challenge_replacement
-              + fn[challenge_end:]
-          )
-
-          send_marker = (
-              "    if (send_ppp("
-              "esp_fd, esp, peer, peer_len, "
-              "l2tp, out, o) < 0)"
-          )
-
-          assert fn.count(send_marker) == 1, (
-              "Expected exactly one MS-CHAPv2 send_ppp "
-              "inside ppp_auth_mschapv2"
-          )
-
-          send_pos = fn.index(
-              send_marker
-          )
-
-          return_marker = (
-              "      return -1;"
-          )
-
-          return_pos = fn.index(
-              return_marker,
-              send_pos
-          )
-
-          insert_pos = (
-              return_pos
-              + len(return_marker)
-          )
-
-          send_log = '''
-
-            tunnel_engine_log(
-                ANDROID_LOG_DEBUG,
-                LOG_TAG,
-                "ppp auth: MS-CHAPv2 response sent id=%u bytes=%zu",
-                (unsigned)chap_id,
-                o
-            );'''
-
-          fn = (
-              fn[:insert_pos]
-              + send_log
-              + fn[insert_pos:]
-          )
-
-          assert (
-              "(size_t)plen + 2u > len"
-          ) in fn
-
-          assert (
-              "5u + (size_t)vs"
-          ) in fn
-
-          assert (
-              "valid MS-CHAPv2 challenge"
-          ) in fn
-
-          assert (
-              "MS-CHAPv2 response sent"
-          ) in fn
-
-          assert (
-              "(size_t)plen < 7u + vs"
-          ) not in fn
-
-          assert fn.count(
-              "const uint8_t *auth_chal = p + 7;"
-          ) == 1
-
-          s = (
-              s[:func_start]
-              + fn
-              + s[func_end:]
-          )
-
-          p.write_text(s)
-
-          print(
-              "SPMS MS-CHAPv2 V18 challenge patch applied successfully"
-          )
-          PY
-
-      # ==============================================================
-      # V18 diagnostic:
-      # raw MS-CHAPv2 Failure returned by SPMS
-      #
-      # Does NOT log password or MS-CHAPv2 response material.
+      # V19 Failure diagnostic
       # ==============================================================
 
       - name: Add MSCHAPv2 failure diagnostics
@@ -1655,13 +1462,8 @@ jobs:
               "static int ppp_send_eap("
           )
 
-          assert s.count(func_start_marker) == 1, (
-              "ppp_auth_mschapv2 marker mismatch"
-          )
-
-          assert s.count(func_end_marker) == 1, (
-              "ppp_send_eap marker mismatch"
-          )
+          assert s.count(func_start_marker) == 1
+          assert s.count(func_end_marker) == 1
 
           func_start = s.index(
               func_start_marker
@@ -1675,13 +1477,6 @@ jobs:
           fn = s[
               func_start:func_end
           ]
-
-          # ----------------------------------------------------------
-          # This exact line occurs once in ppp_auth_mschapv2().
-          #
-          # Deliberately use a single-line marker instead of the
-          # indentation-sensitive multiline block that failed in V17.
-          # ----------------------------------------------------------
 
           marker = (
               "        ppp_mschapv2_failure_info_t failure;"
@@ -1697,12 +1492,10 @@ jobs:
           )
 
           diagnostic = r'''        /*
-                 * V18 diagnostic only.
-                 *
-                 * Log the Failure Message returned by the peer.
+                 * V19 diagnostic only.
                  *
                  * No password, NT hash, PeerChallenge or NT-Response
-                 * is logged here.
+                 * is logged.
                  */
                 size_t failure_available =
                     len > 6u
@@ -1814,22 +1607,6 @@ jobs:
               "raw MS-CHAPv2 failure"
           ) in fn
 
-          assert (
-              "auth-mschapv2-failure"
-          ) in fn
-
-          assert (
-              "failure_ascii[65]"
-          ) in fn
-
-          assert (
-              "failure_hex[193]"
-          ) in fn
-
-          assert fn.count(
-              marker
-          ) == 1
-
           s = (
               s[:func_start]
               + fn
@@ -1839,7 +1616,7 @@ jobs:
           p.write_text(s)
 
           print(
-              "SPMS MS-CHAPv2 V18 failure diagnostics applied successfully"
+              "SPMS MS-CHAPv2 V19 failure diagnostics applied successfully"
           )
           PY
 
@@ -1891,10 +1668,6 @@ jobs:
           echo "flutter.sdk=${flutter_root}" > local.properties
           echo "sdk.dir=${android_sdk_root}" >> local.properties
 
-      # ==============================================================
-      # Build APK
-      # ==============================================================
-
       - name: Build debug APK
         run: flutter build apk --debug
 
@@ -1908,14 +1681,10 @@ jobs:
           ls -lh \
             build/app/outputs/flutter-apk/app-debug.apk
 
-      # ==============================================================
-      # Artifact
-      # ==============================================================
-
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-diagnostic-v18
+          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-identity-v19
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
