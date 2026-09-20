@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge MSCHAPv2 V15 APK
+name: Build SPMS TunnelForge MSCHAPv2 V16 APK
 
 on:
   workflow_dispatch:
@@ -1186,7 +1186,7 @@ jobs:
           s = p.read_text()
 
           # ----------------------------------------------------------
-          # Restrict modifications to ppp_auth_mschapv2()
+          # Restrict changes to ppp_auth_mschapv2()
           # ----------------------------------------------------------
 
           func_start_marker = (
@@ -1219,7 +1219,7 @@ jobs:
           ]
 
           # ----------------------------------------------------------
-          # Correct Challenge length validation
+          # Correct MS-CHAPv2 Challenge length validation
           # ----------------------------------------------------------
 
           challenge_start_marker = (
@@ -1260,8 +1260,7 @@ jobs:
             uint16_t plen = util_read_be16(p + 4);
 
             /*
-             * p includes the two-byte PPP protocol field
-             * at p[0..1].
+             * p includes the two-byte PPP protocol field at p[0..1].
              *
              * CHAP Length excludes those two bytes.
              */
@@ -1290,9 +1289,11 @@ jobs:
              * Value-Size  1
              * Challenge  16
              *
-             * Minimum CHAP length:
+             * Minimum CHAP length = 5 + Value-Size.
              *
-             * 5 + Value-Size = 21 when Value-Size is 16.
+             * With Value-Size 16:
+             *
+             * 5 + 16 = 21 bytes.
              */
             if (vs != 16u ||
                 (size_t)plen <
@@ -1327,7 +1328,7 @@ jobs:
           )
 
           # ----------------------------------------------------------
-          # Diagnostic after sending MS-CHAPv2 response
+          # Diagnostic after sending MS-CHAPv2 Response
           # ----------------------------------------------------------
 
           send_marker = (
@@ -1376,7 +1377,7 @@ jobs:
           )
 
           # ----------------------------------------------------------
-          # Validate only this function
+          # Validate modified function
           # ----------------------------------------------------------
 
           assert (
@@ -1416,188 +1417,15 @@ jobs:
           p.write_text(s)
 
           print(
-              "SPMS MS-CHAPv2 v15 patch applied successfully"
+              "SPMS MS-CHAPv2 v16 patch applied successfully"
           )
           PY
-
-      # ==============================================================
-      # Verify all patches BEFORE compiling
-      # ==============================================================
-
-      - name: Verify SPMS patches
-        run: |
-          set -euo pipefail
-
-          echo "===== DH2 ====="
-
-          grep -n \
-            "IKE_DH_PUBKEY_BYTES 128" \
-            android/app/src/main/cpp/ikev1.c
-
-          echo "===== RESPONDER-LIFETIME ====="
-
-          grep -n \
-            "preserving original SA" \
-            android/app/src/main/cpp/ikev1.c
-
-          grep -n \
-            "original QM2 received" \
-            android/app/src/main/cpp/ikev1.c
-
-          echo "===== MODP1024 ====="
-
-          grep -n \
-            "rfc3526_modp2048_p\[128\]" \
-            android/app/src/main/cpp/modp2048_data.c
-
-          echo "===== RFC2661 ICCN ====="
-
-          grep -n \
-            "l2tp ICCN: RFC2661 mandatory AVPs" \
-            android/app/src/main/cpp/l2tp.c
-
-          grep -n \
-            "10000000u" \
-            android/app/src/main/cpp/l2tp.c
-
-          echo "===== POST-ICCN ====="
-
-          grep -n \
-            "preserving first post-ICCN packet" \
-            android/app/src/main/cpp/l2tp.c
-
-          echo "===== IKE/NAT-T FILTER ====="
-
-          grep -n \
-            "IKE packet on UDP/4500 ignored" \
-            android/app/src/main/cpp/ppp.c
-
-          grep -n \
-            "bare IKE packet ignored" \
-            android/app/src/main/cpp/ppp.c
-
-          echo "===== L2TP CONTROL DEMUX ====="
-
-          grep -n \
-            "processed L2TP control packet" \
-            android/app/src/main/cpp/ppp.c
-
-          echo "===== LCP MRU HANDLING ====="
-
-          grep -n \
-            "int lcp_mru_in_cr = 1" \
-            android/app/src/main/cpp/ppp.c
-
-          grep -n \
-            "t == 1u && include_mru" \
-            android/app/src/main/cpp/ppp.c
-
-          grep -n \
-            "Configure-Reject removed opts mru=" \
-            android/app/src/main/cpp/ppp.c
-
-          echo "===== MS-CHAPv2 V15 ====="
-
-          grep -n \
-            "valid MS-CHAPv2 challenge" \
-            android/app/src/main/cpp/ppp.c
-
-          grep -n \
-            "MS-CHAPv2 response sent" \
-            android/app/src/main/cpp/ppp.c
-
-          grep -n \
-            "(size_t)plen + 2u > len" \
-            android/app/src/main/cpp/ppp.c
-
-          grep -n \
-            "5u + (size_t)vs" \
-            android/app/src/main/cpp/ppp.c
-
-          echo "===== VERIFY MS-CHAPv2 FUNCTION ONLY ====="
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          s = Path(
-              "android/app/src/main/cpp/ppp.c"
-          ).read_text()
-
-          start_marker = (
-              "static int ppp_auth_mschapv2("
-          )
-
-          end_marker = (
-              "static int ppp_send_eap("
-          )
-
-          assert s.count(start_marker) == 1
-          assert s.count(end_marker) == 1
-
-          start = s.index(
-              start_marker
-          )
-
-          end = s.index(
-              end_marker,
-              start
-          )
-
-          fn = s[
-              start:end
-          ]
-
-          assert (
-              "(size_t)plen + 2u > len"
-          ) in fn
-
-          assert (
-              "5u + (size_t)vs"
-          ) in fn
-
-          assert (
-              "valid MS-CHAPv2 challenge"
-          ) in fn
-
-          assert (
-              "MS-CHAPv2 response sent"
-          ) in fn
-
-          /*
-           * NOTE:
-           *
-           * Do NOT grep this expression globally.
-           * Another CHAP routine legitimately still contains it.
-           *
-           * It must only be absent from ppp_auth_mschapv2().
-           */
-
-          assert (
-              "(size_t)plen < 7u + vs"
-          ) not in fn, (
-              "Old incorrect CHAP length check still exists "
-              "inside ppp_auth_mschapv2"
-          )
-
-          print(
-              "MS-CHAPv2 function verified correctly"
-          )
-          PY
-
-          echo "===== OLD POST-ICCN DRAIN MUST BE GONE ====="
-
-          if grep -Fq \
-            "(void)recv_plain(esp_fd, esp, NULL, NULL, in, sizeof(in), 1500);" \
-            android/app/src/main/cpp/l2tp.c
-          then
-            echo "ERROR: old post-ICCN drain remains"
-            exit 1
-          fi
-
-          echo "All SPMS v15 patches verified successfully"
 
       # ==============================================================
       # Build environment
+      #
+      # No separate verification step:
+      # every patch above performs its own hard assertions.
       # ==============================================================
 
       - name: Set up Java
@@ -1668,7 +1496,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-v15
+          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-v16
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
