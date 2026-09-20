@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge MSCHAPv2 V14 APK
+name: Build SPMS TunnelForge MSCHAPv2 V15 APK
 
 on:
   workflow_dispatch:
@@ -301,11 +301,6 @@ jobs:
                 continue;
               }
 
-              /*
-               * UDP/4500:
-               * IKE = 00000000 + ISAKMP
-               * ESP = SPI directly
-               */
               if (prefix) {
 
                 if (qmn < 4 ||
@@ -398,7 +393,7 @@ jobs:
           p.write_text(s)
 
           # ----------------------------------------------------------
-          # RFC 2409 Oakley Group 2 / MODP1024 prime
+          # RFC 2409 Oakley Group 2 / MODP1024
           # ----------------------------------------------------------
 
           prime_hex = (
@@ -457,7 +452,7 @@ jobs:
           PY
 
       # ==============================================================
-      # RFC 2661 ICCN mandatory AVPs
+      # RFC2661 ICCN mandatory AVPs
       # ==============================================================
 
       - name: Patch RFC2661 ICCN mandatory AVPs
@@ -572,10 +567,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # ----------------------------------------------------------
-          # A. Preserve first post-ICCN datagram
-          # ----------------------------------------------------------
-
           lp = Path(
               "android/app/src/main/cpp/l2tp.c"
           )
@@ -610,19 +601,11 @@ jobs:
 
           lp.write_text(ls)
 
-          # ----------------------------------------------------------
-          # B. PPP receive path
-          # ----------------------------------------------------------
-
           pp = Path(
               "android/app/src/main/cpp/ppp.c"
           )
 
           s = pp.read_text()
-
-          # ----------------------------------------------------------
-          # B1. IKEv1 detector
-          # ----------------------------------------------------------
 
           marker = '''static long long ppp_now_ms(void) {
             struct timeval now;
@@ -685,10 +668,6 @@ jobs:
               1
           )
 
-          # ----------------------------------------------------------
-          # B2. recv_ppp receives peer endpoint
-          # ----------------------------------------------------------
-
           old_signature = (
               "static int recv_ppp("
               "int esp_fd, "
@@ -718,10 +697,6 @@ jobs:
               new_signature,
               1
           )
-
-          # ----------------------------------------------------------
-          # B3. IKE/NAT-T filtering before ESP decrypt
-          # ----------------------------------------------------------
 
           recv_start = s.index(
               "static int recv_ppp("
@@ -753,8 +728,10 @@ jobs:
             }
 
             /*
-             * RFC 3948:
-             * IKE = 00000000 + ISAKMP on UDP/4500.
+             * RFC3948:
+             * IKE on UDP/4500 normally uses:
+             *
+             * 00 00 00 00 + ISAKMP
              */
             if (esp->udp_encap &&
                 n >= 32 &&
@@ -773,7 +750,7 @@ jobs:
             }
 
             /*
-             * Defensive case: bare ISAKMP.
+             * Defensive case for bare ISAKMP.
              */
             if (esp->udp_encap &&
                 ppp_isakmp_datagram_like(
@@ -792,14 +769,10 @@ jobs:
           '''
 
           s = (
-              s[:plain_pos] +
-              ike_filter +
-              s[plain_pos:]
+              s[:plain_pos]
+              + ike_filter
+              + s[plain_pos:]
           )
-
-          # ----------------------------------------------------------
-          # B4. L2TP control / PPP data demultiplexing
-          # ----------------------------------------------------------
 
           recv_start = s.index(
               "static int recv_ppp("
@@ -837,10 +810,10 @@ jobs:
                 );
 
             /*
-             * RFC 2661 T bit:
+             * RFC2661 T bit:
              *
-             * T=1 -> control
-             * T=0 -> data
+             * T=1 -> L2TP control
+             * T=0 -> L2TP data / PPP
              */
             if ((l2tp_flags &
                  0x8000u) != 0u) {
@@ -908,14 +881,10 @@ jobs:
           '''
 
           s = (
-              s[:short_start] +
-              demux +
-              s[short_end:]
+              s[:short_start]
+              + demux
+              + s[short_end:]
           )
-
-          # ----------------------------------------------------------
-          # B5. Update recv_ppp call sites
-          # ----------------------------------------------------------
 
           old_call = (
               "recv_ppp("
@@ -959,10 +928,6 @@ jobs:
 
           s = p.read_text()
 
-          # ----------------------------------------------------------
-          # 1. Allow MRU omission
-          # ----------------------------------------------------------
-
           old = '''static int lcp_build_cr(uint8_t *out, size_t cap, uint8_t id, ppp_auth_kind_t auth, uint16_t mru,
                                   int include_address_control, int include_accm, int include_auth) {
           '''
@@ -980,10 +945,6 @@ jobs:
               new,
               1
           )
-
-          # ----------------------------------------------------------
-          # 2. MRU option becomes conditional
-          # ----------------------------------------------------------
 
           old = '''  out[o++] = 1;
             out[o++] = 4;
@@ -1011,10 +972,6 @@ jobs:
               1
           )
 
-          # ----------------------------------------------------------
-          # 3. Configure-Reject parser gets MRU state
-          # ----------------------------------------------------------
-
           old = '''static void lcp_apply_conf_reject(const uint8_t *lcp, size_t lcp_len, int *include_accm, int *include_auth,
                                             int *removed_accm, int *removed_auth) {
             if (removed_accm != NULL)
@@ -1038,10 +995,6 @@ jobs:
               new,
               1
           )
-
-          # ----------------------------------------------------------
-          # 4. Handle MRU option type 1
-          # ----------------------------------------------------------
 
           old = '''    if (t == 2u && include_accm != NULL && *include_accm) {
                 *include_accm = 0;
@@ -1071,10 +1024,6 @@ jobs:
               1
           )
 
-          # ----------------------------------------------------------
-          # 5. Track MRU state
-          # ----------------------------------------------------------
-
           old = '''  int lcp_out_include_ac = 1;
             int lcp_peer_framing_seen = 0;
             int lcp_accm_in_cr = 1;
@@ -1095,10 +1044,6 @@ jobs:
               new,
               1
           )
-
-          # ----------------------------------------------------------
-          # 6. Initial lcp_build_cr call
-          # ----------------------------------------------------------
 
           old = (
               "lcp_build_cr("
@@ -1122,10 +1067,6 @@ jobs:
               new,
               1
           )
-
-          # ----------------------------------------------------------
-          # 7. Remaining three lcp_build_cr calls
-          # ----------------------------------------------------------
 
           old = (
               "lcp_build_cr("
@@ -1151,10 +1092,6 @@ jobs:
               old,
               new
           )
-
-          # ----------------------------------------------------------
-          # 8. Configure-Reject handler
-          # ----------------------------------------------------------
 
           old = '''        int removed_accm = 0;
                   int removed_auth = 0;
@@ -1209,10 +1146,6 @@ jobs:
               1
           )
 
-          # ----------------------------------------------------------
-          # Structural verification
-          # ----------------------------------------------------------
-
           assert (
               "int include_address_control, int include_mru, "
               "int include_accm, int include_auth"
@@ -1238,12 +1171,7 @@ jobs:
           PY
 
       # ==============================================================
-      # MS-CHAPv2
-      #
-      # IMPORTANT:
-      # The patch is deliberately restricted to
-      # ppp_auth_mschapv2() and uses positional markers instead of
-      # matching a large indentation-sensitive block.
+      # MS-CHAPv2 challenge parsing
       # ==============================================================
 
       - name: Patch MSCHAPv2 challenge length handling
@@ -1257,9 +1185,9 @@ jobs:
 
           s = p.read_text()
 
-          # ==========================================================
-          # 1. Isolate ppp_auth_mschapv2()
-          # ==========================================================
+          # ----------------------------------------------------------
+          # Restrict modifications to ppp_auth_mschapv2()
+          # ----------------------------------------------------------
 
           func_start_marker = (
               "static int ppp_auth_mschapv2("
@@ -1290,9 +1218,9 @@ jobs:
               func_start:func_end
           ]
 
-          # ==========================================================
-          # 2. Replace only CHAP Challenge validation block
-          # ==========================================================
+          # ----------------------------------------------------------
+          # Correct Challenge length validation
+          # ----------------------------------------------------------
 
           challenge_start_marker = (
               "    uint8_t chap_id = p[3];"
@@ -1332,20 +1260,10 @@ jobs:
             uint16_t plen = util_read_be16(p + 4);
 
             /*
-             * p still begins with the two-byte PPP Protocol field:
+             * p includes the two-byte PPP protocol field
+             * at p[0..1].
              *
-             *   c2 23
-             *
-             * The CHAP Length field starts at CHAP Code and therefore
-             * does NOT include those two PPP protocol bytes.
-             *
-             * Full received PPP payload:
-             *
-             *     2 bytes protocol + plen bytes CHAP
-             *
-             * Therefore:
-             *
-             *     plen + 2 <= len
+             * CHAP Length excludes those two bytes.
              */
             if (plen < 5u ||
                 (size_t)plen + 2u > len) {
@@ -1366,19 +1284,15 @@ jobs:
             /*
              * MS-CHAPv2 Challenge:
              *
-             *   Code         = 1 byte
-             *   Identifier   = 1 byte
-             *   Length       = 2 bytes
-             *   Value-Size   = 1 byte
-             *   Challenge    = 16 bytes
+             * Code        1
+             * Identifier  1
+             * Length      2
+             * Value-Size  1
+             * Challenge  16
              *
              * Minimum CHAP length:
              *
-             *     5 + Value-Size
-             *
-             * For Value-Size 16:
-             *
-             *     5 + 16 = 21 bytes
+             * 5 + Value-Size = 21 when Value-Size is 16.
              */
             if (vs != 16u ||
                 (size_t)plen <
@@ -1412,11 +1326,9 @@ jobs:
               + fn[challenge_end:]
           )
 
-          # ==========================================================
-          # 3. Insert log immediately after MS-CHAPv2 Response send
-          #
-          # Avoid replacing a multiline indentation-sensitive block.
-          # ==========================================================
+          # ----------------------------------------------------------
+          # Diagnostic after sending MS-CHAPv2 response
+          # ----------------------------------------------------------
 
           send_marker = (
               "    if (send_ppp("
@@ -1463,9 +1375,9 @@ jobs:
               + fn[insert_pos:]
           )
 
-          # ==========================================================
-          # 4. Validate the isolated function before reassembly
-          # ==========================================================
+          # ----------------------------------------------------------
+          # Validate only this function
+          # ----------------------------------------------------------
 
           assert (
               "(size_t)plen + 2u > len"
@@ -1491,9 +1403,9 @@ jobs:
               "const uint8_t *auth_chal = p + 7;"
           ) == 1
 
-          # ==========================================================
-          # 5. Reassemble ppp.c
-          # ==========================================================
+          # ----------------------------------------------------------
+          # Reassemble ppp.c
+          # ----------------------------------------------------------
 
           s = (
               s[:func_start]
@@ -1504,12 +1416,12 @@ jobs:
           p.write_text(s)
 
           print(
-              "SPMS MS-CHAPv2 v14 patch applied successfully"
+              "SPMS MS-CHAPv2 v15 patch applied successfully"
           )
           PY
 
       # ==============================================================
-      # Verify all patches BEFORE build
+      # Verify all patches BEFORE compiling
       # ==============================================================
 
       - name: Verify SPMS patches
@@ -1584,7 +1496,7 @@ jobs:
             "Configure-Reject removed opts mru=" \
             android/app/src/main/cpp/ppp.c
 
-          echo "===== MS-CHAPv2 V14 ====="
+          echo "===== MS-CHAPv2 V15 ====="
 
           grep -n \
             "valid MS-CHAPv2 challenge" \
@@ -1602,15 +1514,75 @@ jobs:
             "5u + (size_t)vs" \
             android/app/src/main/cpp/ppp.c
 
-          echo "===== OLD BAD MS-CHAPv2 TEST MUST BE GONE ====="
+          echo "===== VERIFY MS-CHAPv2 FUNCTION ONLY ====="
 
-          if grep -Fq \
-            "(size_t)plen < 7u + vs" \
-            android/app/src/main/cpp/ppp.c
-          then
-            echo "ERROR: old incorrect MS-CHAPv2 length test remains"
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          s = Path(
+              "android/app/src/main/cpp/ppp.c"
+          ).read_text()
+
+          start_marker = (
+              "static int ppp_auth_mschapv2("
+          )
+
+          end_marker = (
+              "static int ppp_send_eap("
+          )
+
+          assert s.count(start_marker) == 1
+          assert s.count(end_marker) == 1
+
+          start = s.index(
+              start_marker
+          )
+
+          end = s.index(
+              end_marker,
+              start
+          )
+
+          fn = s[
+              start:end
+          ]
+
+          assert (
+              "(size_t)plen + 2u > len"
+          ) in fn
+
+          assert (
+              "5u + (size_t)vs"
+          ) in fn
+
+          assert (
+              "valid MS-CHAPv2 challenge"
+          ) in fn
+
+          assert (
+              "MS-CHAPv2 response sent"
+          ) in fn
+
+          /*
+           * NOTE:
+           *
+           * Do NOT grep this expression globally.
+           * Another CHAP routine legitimately still contains it.
+           *
+           * It must only be absent from ppp_auth_mschapv2().
+           */
+
+          assert (
+              "(size_t)plen < 7u + vs"
+          ) not in fn, (
+              "Old incorrect CHAP length check still exists "
+              "inside ppp_auth_mschapv2"
+          )
+
+          print(
+              "MS-CHAPv2 function verified correctly"
+          )
+          PY
 
           echo "===== OLD POST-ICCN DRAIN MUST BE GONE ====="
 
@@ -1622,7 +1594,7 @@ jobs:
             exit 1
           fi
 
-          echo "All SPMS v14 patches verified successfully"
+          echo "All SPMS v15 patches verified successfully"
 
       # ==============================================================
       # Build environment
@@ -1673,7 +1645,7 @@ jobs:
           echo "sdk.dir=${android_sdk_root}" >> local.properties
 
       # ==============================================================
-      # Build
+      # Build APK
       # ==============================================================
 
       - name: Build debug APK
@@ -1696,7 +1668,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-v14
+          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-v15
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
