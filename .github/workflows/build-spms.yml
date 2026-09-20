@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge MSCHAPv2 V18 APK
+6name: Build SPMS TunnelForge MSCHAPv2 V18 APK
 
 on:
   workflow_dispatch:
@@ -1158,6 +1158,255 @@ jobs:
               "SPMS PPP LCP patch applied successfully"
           )
           PY
+      # ==============================================================
+      # V19 MS-CHAPv2 identity compatibility
+      #
+      # Compatibility test:
+      # - DOMAIN\user -> user
+      # - user@realm  -> user
+      #
+      # Uses the local account name both for ChallengeHash and
+      # for the CHAP Response Name field.
+      # ==============================================================
+
+      - name: Patch MSCHAPv2 SPMS identity compatibility
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "android/app/src/main/cpp/ppp.c"
+          )
+
+          s = p.read_text()
+
+          func_start_marker = (
+              "static int ppp_auth_mschapv2("
+          )
+
+          func_end_marker = (
+              "static int ppp_send_eap("
+          )
+
+          assert s.count(func_start_marker) == 1, (
+              "Expected exactly one ppp_auth_mschapv2 function"
+          )
+
+          assert s.count(func_end_marker) == 1, (
+              "Expected exactly one ppp_send_eap marker"
+          )
+
+          func_start = s.index(
+              func_start_marker
+          )
+
+          func_end = s.index(
+              func_end_marker,
+              func_start
+          )
+
+          fn = s[
+              func_start:func_end
+          ]
+
+          identity_marker = (
+              "    uint8_t peer_chal[16];"
+          )
+
+          assert fn.count(identity_marker) == 1, (
+              "Expected exactly one peer_chal marker "
+              "inside ppp_auth_mschapv2"
+          )
+
+          identity_code = r'''    /*
+             * SPMS V19 identity compatibility.
+             *
+             * Convert:
+             *
+             *   DOMAIN\user -> user
+             *   user@realm  -> user
+             *
+             * No username contents are logged.
+             */
+            char spms_user[256];
+
+            const char *spms_src =
+                user;
+
+            const char *spms_bs =
+                strrchr(
+                    spms_src,
+                    '\\'
+                );
+
+            int spms_had_backslash =
+                spms_bs != NULL;
+
+            if (spms_bs != NULL) {
+              spms_src =
+                  spms_bs + 1;
+            }
+
+            const char *spms_at =
+                strchr(
+                    spms_src,
+                    '@'
+                );
+
+            int spms_had_at =
+                spms_at != NULL;
+
+            size_t spms_user_len =
+                spms_at != NULL
+                    ? (size_t)(
+                          spms_at -
+                          spms_src
+                      )
+                    : strlen(
+                          spms_src
+                      );
+
+            if (spms_user_len == 0u ||
+                spms_user_len >=
+                    sizeof(spms_user)) {
+
+              tunnel_engine_log(
+                  ANDROID_LOG_ERROR,
+                  LOG_TAG,
+                  "ppp auth: SPMS identity normalization failed original_len=%zu effective_len=%zu",
+                  strlen(user),
+                  spms_user_len
+              );
+
+              return -1;
+            }
+
+            memcpy(
+                spms_user,
+                spms_src,
+                spms_user_len
+            );
+
+            spms_user[
+                spms_user_len
+            ] = '\0';
+
+            int spms_changed =
+                strcmp(
+                    spms_user,
+                    user
+                ) != 0;
+
+            tunnel_engine_log(
+                ANDROID_LOG_INFO,
+                LOG_TAG,
+                "ppp auth: SPMS identity mode=local-account original_len=%zu effective_len=%zu stripped_domain=%d stripped_realm=%d changed=%d",
+                strlen(user),
+                spms_user_len,
+                spms_had_backslash,
+                spms_had_at,
+                spms_changed
+            );
+
+    '''
+
+          fn = fn.replace(
+              identity_marker,
+              identity_code +
+              identity_marker,
+              1
+          )
+
+          old_response_call = (
+              "    if (ppp_mschapv2_response_value("
+              "user, password, auth_chal, "
+              "peer_chal, val49) != 0)"
+          )
+
+          new_response_call = (
+              "    if (ppp_mschapv2_response_value("
+              "spms_user, password, auth_chal, "
+              "peer_chal, val49) != 0)"
+          )
+
+          assert fn.count(
+              old_response_call
+          ) == 1, (
+              "MS-CHAPv2 response calculation marker mismatch"
+          )
+
+          fn = fn.replace(
+              old_response_call,
+              new_response_call,
+              1
+          )
+
+          old_name_block = '''    size_t ulen = strlen(user);
+            memcpy(out + o, user, ulen);
+            o += ulen;'''
+
+          new_name_block = '''    size_t ulen =
+                strlen(spms_user);
+
+            if (o + ulen >
+                sizeof(out)) {
+
+              tunnel_engine_log(
+                  ANDROID_LOG_ERROR,
+                  LOG_TAG,
+                  "ppp auth: MS-CHAPv2 response username too long effective_len=%zu",
+                  ulen
+              );
+
+              return -1;
+            }
+
+            memcpy(
+                out + o,
+                spms_user,
+                ulen
+            );
+
+            o += ulen;'''
+
+          assert fn.count(
+              old_name_block
+          ) == 1, (
+              "MS-CHAPv2 response Name marker mismatch"
+          )
+
+          fn = fn.replace(
+              old_name_block,
+              new_name_block,
+              1
+          )
+
+          assert (
+              "identity mode=local-account"
+          ) in fn
+
+          assert (
+              "ppp_mschapv2_response_value("
+              "spms_user, password"
+          ) in fn
+
+          assert (
+              "strlen(spms_user)"
+          ) in fn
+
+          s = (
+              s[:func_start]
+              + fn
+              + s[func_end:]
+          )
+
+          p.write_text(s)
+
+          print(
+              "SPMS MS-CHAPv2 V19 identity compatibility applied successfully"
+          )
+          PY
+          
 
       # ==============================================================
       # MS-CHAPv2 challenge length handling
