@@ -1,4 +1,4 @@
-6name: Build SPMS TunnelForge MSCHAPv2 V18 APK
+name: Build SPMS TunnelForge MSCHAPv2 V18 APK
 
 on:
   workflow_dispatch:
