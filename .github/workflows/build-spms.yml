@@ -1,4 +1,4 @@
-name: Build SPMS TunnelForge MSCHAPv2 V17 APK
+name: Build SPMS TunnelForge MSCHAPv2 V18 APK
 
 on:
   workflow_dispatch:
@@ -29,6 +29,10 @@ jobs:
 
           p = Path("android/app/src/main/cpp/ikev1.c")
           s = p.read_text()
+
+          # ----------------------------------------------------------
+          # DH14 / MODP2048 -> DH2 / MODP1024
+          # ----------------------------------------------------------
 
           old = "#define IKE_DH_PUBKEY_BYTES 256"
           assert old in s, "IKE_DH_PUBKEY_BYTES marker not found"
@@ -61,6 +65,10 @@ jobs:
               dh14,
               dh2
           )
+
+          # ----------------------------------------------------------
+          # Cisco/SPMS RESPONDER-LIFETIME
+          # ----------------------------------------------------------
 
           start_marker = (
               '  ike_log_isakmp_summary('
@@ -383,6 +391,10 @@ jobs:
 
           p.write_text(s)
 
+          # ----------------------------------------------------------
+          # RFC2409 Oakley Group 2 / MODP1024
+          # ----------------------------------------------------------
+
           prime_hex = (
               "FFFFFFFFFFFFFFFFC90FDAA22168C234"
               "C4C6628B80DC1CD129024E088A67CC74"
@@ -462,7 +474,12 @@ jobs:
           new = '''  ao = 0;
 
             /*
-             * RFC 2661 section 6.8
+             * RFC 2661 section 6.8:
+             *
+             * ICCN mandatory AVPs:
+             *   Message Type
+             *   Tx Connect Speed
+             *   Framing Type
              */
 
             avp_u16(
@@ -561,7 +578,9 @@ jobs:
               drain_line,
               '''  /*
            * SPMS/Cisco compatibility:
-           * preserve first post-ICCN packet.
+           *
+           * Preserve first post-ICCN packet.
+           * PPP receive will demultiplex L2TP control/data.
            */
           tunnel_engine_log(
               ANDROID_LOG_DEBUG,
@@ -593,6 +612,9 @@ jobs:
             return ((long long)now.tv_sec * 1000ll) + ((long long)now.tv_usec / 1000ll);
           }
 
+          /*
+           * UDP/4500 is shared by NAT-T ESP and IKE.
+           */
           static int ppp_isakmp_datagram_like(
               const uint8_t *p,
               size_t len) {
@@ -697,7 +719,8 @@ jobs:
             }
 
             /*
-             * IKE on UDP/4500 with RFC3948 non-ESP marker.
+             * RFC3948:
+             * IKE = 00000000 + ISAKMP on UDP/4500.
              */
             if (esp->udp_encap &&
                 n >= 32 &&
@@ -715,6 +738,9 @@ jobs:
               continue;
             }
 
+            /*
+             * Defensive case for bare ISAKMP.
+             */
             if (esp->udp_encap &&
                 ppp_isakmp_datagram_like(
                     raw,
@@ -772,6 +798,12 @@ jobs:
                     plain
                 );
 
+            /*
+             * RFC 2661 T bit:
+             *
+             * T=1 -> control
+             * T=0 -> data
+             */
             if ((l2tp_flags &
                  0x8000u) != 0u) {
 
@@ -871,7 +903,7 @@ jobs:
           PY
 
       # ==============================================================
-      # PPP LCP
+      # PPP LCP compatibility
       # ==============================================================
 
       - name: Patch PPP LCP MRU rejection handling
@@ -1128,7 +1160,7 @@ jobs:
           PY
 
       # ==============================================================
-      # MS-CHAPv2 challenge
+      # MS-CHAPv2 challenge length handling
       # ==============================================================
 
       - name: Patch MSCHAPv2 challenge length handling
@@ -1150,8 +1182,13 @@ jobs:
               "static int ppp_send_eap("
           )
 
-          assert s.count(func_start_marker) == 1
-          assert s.count(func_end_marker) == 1
+          assert s.count(func_start_marker) == 1, (
+              "Expected exactly one ppp_auth_mschapv2 function"
+          )
+
+          assert s.count(func_end_marker) == 1, (
+              "Expected exactly one ppp_send_eap marker"
+          )
 
           func_start = s.index(
               func_start_marker
@@ -1176,11 +1213,17 @@ jobs:
 
           assert fn.count(
               challenge_start_marker
-          ) == 1
+          ) == 1, (
+              "Expected exactly one CHAP parser start "
+              "inside ppp_auth_mschapv2"
+          )
 
           assert fn.count(
               challenge_end_marker
-          ) == 1
+          ) == 1, (
+              "Expected exactly one auth_chal marker "
+              "inside ppp_auth_mschapv2"
+          )
 
           challenge_start = fn.index(
               challenge_start_marker
@@ -1197,6 +1240,10 @@ jobs:
           challenge_replacement = '''    uint8_t chap_id = p[3];
             uint16_t plen = util_read_be16(p + 4);
 
+            /*
+             * p includes the two-byte PPP protocol field at p[0..1].
+             * CHAP Length excludes those two bytes.
+             */
             if (plen < 5u ||
                 (size_t)plen + 2u > len) {
 
@@ -1213,6 +1260,12 @@ jobs:
 
             uint8_t vs = p[6];
 
+            /*
+             * Minimum Challenge CHAP length:
+             * 5 + Value-Size.
+             *
+             * Value-Size = 16 => minimum 21 bytes.
+             */
             if (vs != 16u ||
                 (size_t)plen <
                     5u + (size_t)vs) {
@@ -1251,7 +1304,10 @@ jobs:
               "l2tp, out, o) < 0)"
           )
 
-          assert fn.count(send_marker) == 1
+          assert fn.count(send_marker) == 1, (
+              "Expected exactly one MS-CHAPv2 send_ppp "
+              "inside ppp_auth_mschapv2"
+          )
 
           send_pos = fn.index(
               send_marker
@@ -1307,6 +1363,10 @@ jobs:
               "(size_t)plen < 7u + vs"
           ) not in fn
 
+          assert fn.count(
+              "const uint8_t *auth_chal = p + 7;"
+          ) == 1
+
           s = (
               s[:func_start]
               + fn
@@ -1316,20 +1376,15 @@ jobs:
           p.write_text(s)
 
           print(
-              "SPMS MS-CHAPv2 v17 challenge patch applied successfully"
+              "SPMS MS-CHAPv2 V18 challenge patch applied successfully"
           )
           PY
 
       # ==============================================================
-      # V17 diagnostic: raw MS-CHAPv2 Failure
+      # V18 diagnostic:
+      # raw MS-CHAPv2 Failure returned by SPMS
       #
-      # Does NOT log:
-      # - password
-      # - NT hash
-      # - PeerChallenge
-      # - NT-Response
-      #
-      # It only logs the Failure message returned by the peer.
+      # Does NOT log password or MS-CHAPv2 response material.
       # ==============================================================
 
       - name: Add MSCHAPv2 failure diagnostics
@@ -1372,26 +1427,33 @@ jobs:
               func_start:func_end
           ]
 
-          old = '''      if (len >= 4 && util_read_be16(p) == PROTO_CHAP && p[2] == 4) {
-                uint16_t chap_len = len >= 6 ? util_read_be16(p + 4) : 0u;
-                ppp_mschapv2_failure_info_t failure;'''
+          # ----------------------------------------------------------
+          # This exact line occurs once in ppp_auth_mschapv2().
+          #
+          # Deliberately use a single-line marker instead of the
+          # indentation-sensitive multiline block that failed in V17.
+          # ----------------------------------------------------------
 
-          new = '''      if (len >= 4 && util_read_be16(p) == PROTO_CHAP && p[2] == 4) {
-                uint16_t chap_len = len >= 6 ? util_read_be16(p + 4) : 0u;
+          marker = (
+              "        ppp_mschapv2_failure_info_t failure;"
+          )
 
-                /*
-                 * V17 diagnostics.
+          count = fn.count(
+              marker
+          )
+
+          assert count == 1, (
+              f"Expected exactly one MS-CHAPv2 failure "
+              f"structure marker, found {count}"
+          )
+
+          diagnostic = r'''        /*
+                 * V18 diagnostic only.
                  *
-                 * CHAP Length excludes the two-byte PPP protocol field.
-                 * Failure Message begins immediately after:
+                 * Log the Failure Message returned by the peer.
                  *
-                 * Code + Identifier + Length = 4 CHAP bytes.
-                 *
-                 * p[0..1] = PPP protocol
-                 * p[2]    = CHAP code
-                 * p[3]    = identifier
-                 * p[4..5] = CHAP length
-                 * p[6..]  = Failure Message
+                 * No password, NT hash, PeerChallenge or NT-Response
+                 * is logged here.
                  */
                 size_t failure_available =
                     len > 6u
@@ -1409,14 +1471,10 @@ jobs:
                         : failure_available;
 
                 const uint8_t *failure_msg =
-                    len > 6u
+                    failure_msg_len > 0u
                         ? p + 6
                         : NULL;
 
-                /*
-                 * Keep the dump bounded.
-                 * RFC2759 Failure messages are normally short ASCII.
-                 */
                 size_t dump_len =
                     failure_msg_len > 64u
                         ? 64u
@@ -1427,7 +1485,7 @@ jobs:
 
                 size_t hpos = 0u;
 
-                for (size_t k = 0;
+                for (size_t k = 0u;
                      k < dump_len;
                      k++) {
 
@@ -1440,18 +1498,40 @@ jobs:
                           ? (char)c
                           : '.';
 
-                  hpos += (size_t)snprintf(
-                      failure_hex + hpos,
-                      sizeof(failure_hex) - hpos,
-                      k + 1u < dump_len
-                          ? "%02x "
-                          : "%02x",
-                      (unsigned)c
-                  );
+                  if (hpos <
+                      sizeof(failure_hex) - 1u) {
+
+                    int written =
+                        snprintf(
+                            failure_hex + hpos,
+                            sizeof(failure_hex) - hpos,
+                            k + 1u < dump_len
+                                ? "%02x "
+                                : "%02x",
+                            (unsigned)c
+                        );
+
+                    if (written < 0) {
+                      hpos = 0u;
+                      break;
+                    }
+
+                    if ((size_t)written >=
+                        sizeof(failure_hex) - hpos) {
+
+                      hpos =
+                          sizeof(failure_hex) - 1u;
+
+                      break;
+                    }
+
+                    hpos +=
+                        (size_t)written;
+                  }
                 }
 
-                failure_ascii[dump_len] = '\\0';
-                failure_hex[hpos] = '\\0';
+                failure_ascii[dump_len] = '\0';
+                failure_hex[hpos] = '\0';
 
                 ppp_log_rx_summary(
                     p,
@@ -1462,7 +1542,7 @@ jobs:
                 tunnel_engine_log(
                     ANDROID_LOG_ERROR,
                     LOG_TAG,
-                    "ppp auth: raw MS-CHAPv2 failure id=%u chap_len=%u frame_len=%zu declared_msg_len=%zu available_msg_len=%zu dump_len=%zu ascii=\\"%s\\" hex=%s",
+                    "ppp auth: raw MS-CHAPv2 failure id=%u chap_len=%u frame_len=%zu declared_msg_len=%zu available_msg_len=%zu dump_len=%zu ascii=\"%s\" hex=%s",
                     (unsigned)p[3],
                     (unsigned)chap_len,
                     len,
@@ -1473,18 +1553,11 @@ jobs:
                     failure_hex
                 );
 
-                ppp_mschapv2_failure_info_t failure;'''
-
-          count = fn.count(old)
-
-          assert count == 1, (
-              f"Expected one MS-CHAPv2 Failure marker, "
-              f"found {count}"
-          )
+          '''
 
           fn = fn.replace(
-              old,
-              new,
+              marker,
+              diagnostic + marker,
               1
           )
 
@@ -1504,6 +1577,10 @@ jobs:
               "failure_hex[193]"
           ) in fn
 
+          assert fn.count(
+              marker
+          ) == 1
+
           s = (
               s[:func_start]
               + fn
@@ -1513,7 +1590,7 @@ jobs:
           p.write_text(s)
 
           print(
-              "SPMS MS-CHAPv2 v17 failure diagnostics applied successfully"
+              "SPMS MS-CHAPv2 V18 failure diagnostics applied successfully"
           )
           PY
 
@@ -1589,7 +1666,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
-          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-diagnostic-v17
+          name: tunnel-forge-spms-dh2-iccn-lcp-mschapv2-diagnostic-v18
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
           if-no-files-found: error
